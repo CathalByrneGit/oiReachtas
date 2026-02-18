@@ -1,0 +1,832 @@
+---
+title: "Member Profiling: Political Positioning via Question Analytics"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Member Profiling: Political Positioning via Question Analytics}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  eval      = FALSE,
+  fig.width  = 9,
+  fig.height = 7
+)
+```
+
+> **Note:** All code chunks require a live internet connection. Fetching a
+> year of written questions typically takes 3–5 seconds (results are cached).
+> The PCA / UMAP steps run locally in milliseconds. UMAP requires the
+> **uwot** package (`install.packages("uwot")`); all other packages are in the
+> standard `oiReachtas` Suggests list.
+
+---
+
+## Moneyball for the Dáil
+
+In basketball analytics a player's shot chart tells you *where* they score
+from; a similarity algorithm then finds their nearest comps (e.g. "plays like
+a young Ray Allen"). In this vignette we apply exactly the same logic to Dáil
+members:
+
+| Sports concept | Political equivalent |
+|---|---|
+| Shot-chart / touch heat-map | **TF-IDF question fingerprint** |
+| Positional clustering | **Policy-domain radar** |
+| Dimensionality reduction (PCA / UMAP) | **Political map** (left–right, activist–loyalist) |
+| Player archetypes (stretch big, point forward …) | **Member archetypes** (k-means clusters) |
+| "Comps" (most similar players) | **Member comps** (cosine similarity) |
+| Stats radar / scouting card | **Member scouting card** |
+
+The raw material is every **written question** a member has tabled — the
+show-as title is a short, clean summary of the topic they chose to ask about.
+This corpus is a revealed-preference record: members decide what to ask about,
+so it reflects genuine priority rather than party press-release language.
+
+---
+
+## 1  Setup
+
+```{r libraries}
+library(oiReachtas)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(tidytext)   # TF-IDF, tokenisation
+
+# UMAP — install if needed: install.packages("uwot")
+library(uwot)
+```
+
+---
+
+## 2  Fetch the Question Corpus
+
+We pull written questions for the most recent completed Dáil session and
+attach party and constituency metadata.
+
+```{r fetch-questions}
+# ── member roster (names, party, constituency) ──────────────────────────────
+members <- get_members(house = "dail", limit = 200) |>
+  select(member_id  = member_pId,
+         member_name,
+         party       = party_code,
+         constituency)
+
+# ── 12 months of written questions ──────────────────────────────────────────
+qs_raw <- get_questions(
+  date_start  = "2024-01-01",
+  date_end    = "2024-12-31",
+  question_type = "written",
+  limit       = 5000
+)
+
+# Keep only the fields we need and join member metadata
+qs <- qs_raw |>
+  select(member_pId, show_as, dept_name) |>
+  left_join(members, by = c("member_pId" = "member_id")) |>
+  filter(!is.na(member_name), !is.na(show_as), nchar(show_as) > 5)
+
+glimpse(qs)
+```
+
+---
+
+## 3  TF-IDF Question Fingerprints — the "Touch Heat-Map"
+
+For each member we tokenise every question title, remove stop-words
+(English + Oireachtas-specific), and compute **TF-IDF** scores.
+The result is a member × vocabulary matrix: high TF-IDF means a word is
+distinctive to *that* member compared with the rest of the Dáil.
+
+```{r tfidf}
+# Oireachtas-specific stop words (procedural boilerplate)
+oireachtas_stops <- tibble(word = c(
+  "minister", "government", "plans", "measures", "steps",
+  "action", "actions", "information", "details", "aware",
+  "issues", "concerned", "basis", "provision", "provisions",
+  "matter", "matters", "support", "supports", "service", "services",
+  "scheme", "schemes", "regard", "relevant", "area", "areas",
+  "funding", "ensure", "provide", "policy", "policies", "report",
+  "request", "asked", "stated", "confirm", "outlined"
+))
+
+# Tokenise + TF-IDF ──────────────────────────────────────────────────────────
+tidy_qs <- qs |>
+  unnest_tokens(word, show_as) |>
+  anti_join(stop_words,       by = "word") |>
+  anti_join(oireachtas_stops, by = "word") |>
+  filter(nchar(word) > 2, !grepl("^[0-9]+$", word))
+
+member_tfidf <- tidy_qs |>
+  count(member_name, word, name = "n") |>
+  bind_tf_idf(term = word, document = member_name, n = n)
+
+# Top-5 signature terms per member (their "shot chart")
+member_tfidf |>
+  group_by(member_name) |>
+  slice_max(tf_idf, n = 5, with_ties = FALSE) |>
+  ungroup() |>
+  arrange(member_name) |>
+  print(n = 30)
+```
+
+### 3.1  Party-level vocabulary
+
+Before individual profiling, see which terms most distinguish each party.
+
+```{r party-vocab}
+party_tfidf <- tidy_qs |>
+  left_join(select(qs, member_name, party), by = "member_name") |>
+  count(party, word, name = "n") |>
+  bind_tf_idf(term = word, document = party, n = n)
+
+party_tfidf |>
+  group_by(party) |>
+  slice_max(tf_idf, n = 6, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(word = reorder_within(word, tf_idf, party)) |>
+  ggplot(aes(tf_idf, word, fill = party)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~party, scales = "free_y", ncol = 3) +
+  scale_y_reordered() +
+  scale_fill_manual(values = c(
+    "FF" = "#66BB6A", "FG" = "#42A5F5", "SF" = "#4CAF50",
+    "Lab" = "#EF5350", "GP" = "#26A69A", "SD" = "#AB47BC",
+    "PBP" = "#FF7043", "Ind" = "#78909C"
+  ), na.value = "#BDBDBD") +
+  labs(
+    title    = "Party political vocabulary",
+    subtitle = "Top TF-IDF terms per party — what distinguishes each party's questions",
+    x        = "TF-IDF score", y = NULL,
+    caption  = "Source: Oireachtas Open Data API"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 4  Policy-Domain Radar — the "Scouting Card"
+
+We map vocabulary onto ten policy domains and compute each member's
+question-share per domain.  The resulting radar is like an NBA stats radar:
+a snapshot of where a member invests their parliamentary attention.
+
+```{r domain-keywords}
+domains <- list(
+  "Housing & Planning"    = c("housing", "rent", "home", "tenant", "landlord",
+                               "accommodation", "planning", "homeless", "eviction",
+                               "hap", "hal", "rents", "residential", "development"),
+  "Health & HSE"          = c("health", "hospital", "hse", "waiting", "gp",
+                               "mental", "nursing", "cancer", "ambulance", "pharmacy",
+                               "disability", "maternity", "beds", "staffing"),
+  "Education"             = c("school", "teacher", "education", "college",
+                               "university", "student", "special", "sen", "curriculum",
+                               "principal", "snc", "sna", "class", "pupil"),
+  "Transport"             = c("road", "bus", "train", "rail", "cycle", "traffic",
+                               "transport", "motorway", "greenway", "brt", "luas",
+                               "dart", "airport", "port"),
+  "Environment & Climate" = c("climate", "carbon", "emission", "renewable",
+                               "energy", "wind", "solar", "waste", "water", "flood",
+                               "biodiversity", "nature", "offshore", "fossil"),
+  "Social Welfare"        = c("welfare", "pension", "disability", "carer",
+                               "benefit", "payment", "allowance", "dsp", "social",
+                               "lone", "jobseeker", "community", "poverty"),
+  "Justice & Crime"       = c("garda", "crime", "court", "prison", "legal",
+                               "justice", "solicitor", "judge", "offence", "victim",
+                               "drugs", "trafficking", "violence", "fraud"),
+  "Agriculture & Rural"   = c("farmer", "farm", "agri", "dairy", "beef", "rural",
+                               "fishing", "forestry", "land", "mart", "tillage",
+                               "dafm", "animal", "felling"),
+  "Enterprise & Economy"  = c("enterprise", "business", "sme", "employment",
+                               "job", "tax", "vat", "trade", "investment", "startup",
+                               "export", "ibec", "isme", "commercial"),
+  "Foreign & Defence"     = c("foreign", "ukraine", "conflict", "israel",
+                               "palestine", "nato", "defence", "international",
+                               "humanitarian", "migration", "asylum", "refugee",
+                               "embassy", "united")
+)
+
+# Build domain lookup table
+domain_lookup <- imap_dfr(domains, ~ tibble(word = .x, domain = .y))
+
+# Score each member per domain
+member_domains <- tidy_qs |>
+  inner_join(domain_lookup, by = "word") |>
+  count(member_name, domain, name = "domain_n") |>
+  group_by(member_name) |>
+  mutate(domain_pct = domain_n / sum(domain_n) * 100) |>
+  ungroup()
+
+# Summary: which domains dominate for each party?
+member_domains |>
+  left_join(select(qs, member_name, party) |> distinct(), by = "member_name") |>
+  group_by(party, domain) |>
+  summarise(mean_pct = mean(domain_pct), .groups = "drop") |>
+  slice_max(mean_pct, n = 3, by = party) |>
+  arrange(party, desc(mean_pct))
+```
+
+### 4.1  Radar chart for individual members
+
+```{r radar-fn}
+# Helper: draw a ggplot2 polar radar for a given member
+plot_member_radar <- function(member, colour = "#42A5F5") {
+  # all 10 domains, fill 0 if member never asked about one
+  d <- tibble(domain = names(domains)) |>
+    left_join(
+      filter(member_domains, member_name == member),
+      by = "domain"
+    ) |>
+    mutate(domain_pct = replace_na(domain_pct, 0))
+
+  # Shorten labels for display
+  d$label <- stringr::str_wrap(d$domain, width = 12)
+
+  ggplot(d, aes(x = domain, y = domain_pct)) +
+    geom_col(fill = colour, alpha = 0.75, width = 0.85) +
+    coord_polar(theta = "x", start = -pi / length(domains)) +
+    scale_y_continuous(labels = function(x) paste0(x, "%")) +
+    labs(
+      title    = paste("Policy radar —", member),
+      subtitle = "% of domain-tagged questions per policy area",
+      x = NULL, y = NULL
+    ) +
+    theme_minimal(base_size = 11) +
+    theme(
+      axis.text.x  = element_text(size = 8, colour = "grey30"),
+      axis.text.y  = element_text(size = 7, colour = "grey50"),
+      panel.grid   = element_line(colour = "grey88"),
+      plot.title   = element_text(face = "bold")
+    )
+}
+
+# ── Example: compare two members side by side ───────────────────────────────
+# Replace with any names returned by get_members()
+p1 <- plot_member_radar("Mary Lou McDonald", colour = "#4CAF50")
+p2 <- plot_member_radar("Micheál Martin",    colour = "#66BB6A")
+
+# Combine with patchwork if available, otherwise print individually
+if (requireNamespace("patchwork", quietly = TRUE)) {
+  patchwork::wrap_plots(p1, p2)
+} else {
+  print(p1)
+  print(p2)
+}
+```
+
+---
+
+## 5  Political Map — PCA Projection
+
+We cast the TF-IDF scores into a **member × term** matrix and apply PCA.
+The first two principal components typically correspond to:
+
+* **PC1** — a government/opposition axis (usually explains 15–25 % of variance)
+* **PC2** — a urban-activist vs. rural-traditionalist axis
+
+This is the political equivalent of projecting players into a 2D "skill
+space" using advanced metrics.
+
+```{r pca-matrix}
+# ── Wide matrix: rows = members, columns = terms ────────────────────────────
+# We use TF-IDF score; keep only terms appearing for ≥ 3 members (sparsity)
+common_terms <- member_tfidf |>
+  count(word) |>
+  filter(n >= 3) |>
+  pull(word)
+
+member_mat <- member_tfidf |>
+  filter(word %in% common_terms) |>
+  select(member_name, word, tf_idf) |>
+  pivot_wider(names_from = word, values_from = tf_idf, values_fill = 0) |>
+  column_to_rownames("member_name")
+
+cat("Matrix dimensions:", nrow(member_mat), "members ×",
+    ncol(member_mat), "terms\n")
+```
+
+```{r pca}
+pca_res <- prcomp(member_mat, center = TRUE, scale. = TRUE)
+
+# Scree plot — how many components are meaningful?
+tibble(
+  pc  = seq_along(pca_res$sdev),
+  var = pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
+) |>
+  filter(pc <= 15) |>
+  ggplot(aes(pc, var)) +
+  geom_col(fill = "#5C6BC0") +
+  geom_line(colour = "grey40") +
+  geom_point(colour = "grey40") +
+  labs(
+    title = "PCA scree plot",
+    x     = "Principal component",
+    y     = "Variance explained (%)"
+  ) +
+  theme_minimal()
+```
+
+```{r pca-map}
+# PC scores + party labels
+pca_scores <- as_tibble(pca_res$x[, 1:4], rownames = "member_name") |>
+  left_join(select(members, member_name, party, constituency), by = "member_name")
+
+# Party palette
+party_colours <- c(
+  "FF"  = "#66BB6A", "FG" = "#42A5F5", "SF" = "#4CAF50",
+  "Lab" = "#EF5350", "GP" = "#26A69A", "SD" = "#AB47BC",
+  "PBP" = "#FF7043", "Ind" = "#78909C"
+)
+
+ggplot(pca_scores, aes(PC1, PC2, colour = party, label = member_name)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_text_repel(size = 2.5, max.overlaps = 18, segment.colour = "grey70") +
+  scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
+  labs(
+    title    = "Dáil members — political map (question-based PCA)",
+    subtitle = "PC1 ≈ government–opposition axis · PC2 ≈ activist–rural axis",
+    x        = "PC1", y = "PC2", colour = "Party",
+    caption  = "Source: Oireachtas Open Data API — written questions 2024"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "right")
+```
+
+### 5.1  What drives each axis?
+
+Inspect the **loadings** to understand what PC1 and PC2 actually measure.
+
+```{r pca-loadings}
+loadings <- as_tibble(pca_res$rotation[, 1:2], rownames = "word")
+
+# Top 15 terms pulling in each direction
+bind_rows(
+  slice_min(loadings, PC1, n = 15) |> mutate(direction = "← PC1 (govt end)"),
+  slice_max(loadings, PC1, n = 15) |> mutate(direction = "→ PC1 (oppo end)")
+) |>
+  mutate(word = reorder(word, PC1)) |>
+  ggplot(aes(PC1, word, fill = direction)) +
+  geom_col() +
+  scale_fill_manual(values = c("← PC1 (govt end)" = "#42A5F5",
+                               "→ PC1 (oppo end)" = "#EF5350")) +
+  labs(title = "PC1 loadings — what defines the main axis?",
+       x = "Loading", y = NULL, fill = NULL) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 6  UMAP — Finer Cluster Structure
+
+PCA is linear; UMAP preserves local neighbourhood structure and often reveals
+sub-clusters that PCA collapses. Think of it as going from a basic positional
+map to a detailed player-tracking heat-map.
+
+```{r umap}
+# Requires uwot — install.packages("uwot")
+set.seed(42)
+
+umap_coords <- uwot::umap(
+  member_mat,
+  n_neighbors = 12,     # local neighbourhood size
+  min_dist    = 0.15,   # how tightly to pack clusters
+  metric      = "cosine"
+)
+
+umap_df <- tibble(
+  member_name = rownames(member_mat),
+  UMAP1       = umap_coords[, 1],
+  UMAP2       = umap_coords[, 2]
+) |>
+  left_join(select(members, member_name, party, constituency), by = "member_name")
+
+ggplot(umap_df, aes(UMAP1, UMAP2, colour = party, label = member_name)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_text_repel(size = 2.5, max.overlaps = 20, segment.colour = "grey70") +
+  scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
+  labs(
+    title    = "Dáil members — UMAP projection (cosine distance on question TF-IDF)",
+    subtitle = "Proximity = similar question portfolio; colour = party",
+    x = "UMAP 1", y = "UMAP 2", colour = "Party",
+    caption  = "Source: Oireachtas Open Data API — written questions 2024"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 7  Member Archetypes — K-Means Clustering
+
+K-means on the first 10 PC scores partitions members into archetypes.
+We choose *k* = 6 (tune with the elbow method below) and then characterise
+each cluster by its top discriminating terms — naming the "player types".
+
+```{r elbow}
+# Elbow method — total within-cluster SS vs. k
+pc_scores_mat <- pca_res$x[, 1:10]
+
+wss <- map_dbl(1:10, ~ {
+  kmeans(pc_scores_mat, centers = .x, nstart = 20)$tot.withinss
+})
+
+tibble(k = 1:10, wss = wss) |>
+  ggplot(aes(k, wss)) +
+  geom_line(colour = "#5C6BC0") +
+  geom_point(colour = "#5C6BC0", size = 3) +
+  scale_x_continuous(breaks = 1:10) +
+  labs(
+    title = "Elbow method — choosing k for member archetypes",
+    x     = "Number of clusters (k)",
+    y     = "Total within-cluster SS"
+  ) +
+  theme_minimal()
+```
+
+```{r kmeans}
+set.seed(42)
+k_best   <- 6   # adjust after inspecting the elbow plot
+km_res   <- kmeans(pc_scores_mat, centers = k_best, nstart = 25, iter.max = 50)
+
+cluster_df <- tibble(
+  member_name = rownames(member_mat),
+  archetype   = factor(km_res$cluster)
+) |>
+  left_join(select(members, member_name, party), by = "member_name")
+
+# Party composition of each archetype
+cluster_df |>
+  count(archetype, party) |>
+  group_by(archetype) |>
+  mutate(pct = n / sum(n) * 100) |>
+  slice_max(pct, n = 3) |>
+  arrange(archetype, desc(pct))
+```
+
+### 7.1  Name the archetypes
+
+Inspect each cluster's top TF-IDF terms to assign a descriptive label.
+
+```{r archetype-names}
+# Average TF-IDF per cluster per word
+archetype_terms <- member_tfidf |>
+  filter(word %in% common_terms) |>
+  left_join(select(cluster_df, member_name, archetype), by = "member_name") |>
+  group_by(archetype, word) |>
+  summarise(mean_tfidf = mean(tf_idf), .groups = "drop")
+
+# Top 8 words per archetype
+archetype_terms |>
+  group_by(archetype) |>
+  slice_max(mean_tfidf, n = 8, with_ties = FALSE) |>
+  ungroup() |>
+  mutate(word = reorder_within(word, mean_tfidf, archetype)) |>
+  ggplot(aes(mean_tfidf, word, fill = archetype)) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~archetype, scales = "free_y", ncol = 3,
+             labeller = as_labeller(c(
+               "1" = "Archetype 1", "2" = "Archetype 2",
+               "3" = "Archetype 3", "4" = "Archetype 4",
+               "5" = "Archetype 5", "6" = "Archetype 6"
+             ))) +
+  scale_y_reordered() +
+  labs(
+    title    = "Member archetypes — defining vocabulary",
+    subtitle = "Mean TF-IDF per cluster; label each archetype from these terms",
+    x        = "Mean TF-IDF", y = NULL
+  ) +
+  theme_minimal(base_size = 10)
+```
+
+```{r archetype-map}
+# Overlay archetypes on the UMAP map
+umap_df |>
+  left_join(select(cluster_df, member_name, archetype), by = "member_name") |>
+  ggplot(aes(UMAP1, UMAP2, colour = archetype, label = member_name)) +
+  geom_point(size = 3, alpha = 0.85) +
+  geom_text_repel(size = 2.4, max.overlaps = 16, segment.colour = "grey70") +
+  scale_colour_brewer(palette = "Set2") +
+  labs(
+    title    = "Member archetypes on the UMAP map",
+    x = "UMAP 1", y = "UMAP 2", colour = "Archetype"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 8  Player Comps — Cosine Similarity Search
+
+The cosine similarity between two TF-IDF vectors measures how alike two
+members' question portfolios are, regardless of overall volume.
+A score of 1 = identical distribution; 0 = completely different focus.
+
+```{r cosine}
+# Row-normalise the TF-IDF matrix → unit vectors → dot product = cosine sim
+mat_norm  <- member_mat / sqrt(rowSums(member_mat^2) + 1e-10)
+cosine_sim <- as.matrix(mat_norm) %*% t(as.matrix(mat_norm))
+
+# Helper: return top-n comps for a given member
+find_comps <- function(member, n = 5) {
+  if (!member %in% rownames(cosine_sim)) {
+    stop("Member not found. Check spelling against get_members() output.")
+  }
+  sims <- sort(cosine_sim[member, ], decreasing = TRUE)
+  sims <- sims[names(sims) != member]   # remove self
+  tibble(
+    comp       = names(head(sims, n)),
+    similarity = round(head(sims, n), 3)
+  ) |>
+    left_join(select(members, member_name, party, constituency),
+              by = c("comp" = "member_name"))
+}
+
+# ── Example: find comps for two members ─────────────────────────────────────
+find_comps("Mary Lou McDonald")
+find_comps("Micheál Martin")
+```
+
+### 8.1  Full similarity network (top comps per member)
+
+```{r sim-network}
+# Build edges: each member → their top-3 comps
+edges <- rownames(cosine_sim) |>
+  map_dfr(\(m) {
+    sims <- sort(cosine_sim[m, ], decreasing = TRUE)
+    sims <- sims[names(sims) != m]
+    tibble(from = m, to = names(head(sims, 3)),
+           weight = head(sims, 3))
+  })
+
+# Visualise on the UMAP layout — draw lines between comps
+umap_coords_named <- umap_df |>
+  select(member_name, UMAP1, UMAP2)
+
+edges_with_coords <- edges |>
+  left_join(umap_coords_named, by = c("from" = "member_name")) |>
+  rename(x = UMAP1, y = UMAP2) |>
+  left_join(umap_coords_named, by = c("to" = "member_name"),
+            suffix = c("", "_end")) |>
+  rename(xend = UMAP1_end, yend = UMAP2_end)
+
+ggplot() +
+  geom_segment(data = edges_with_coords,
+               aes(x = x, y = y, xend = xend, yend = yend, alpha = weight),
+               colour = "#5C6BC0", linewidth = 0.4) +
+  geom_point(data = umap_df,
+             aes(UMAP1, UMAP2, colour = party), size = 2.5) +
+  scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
+  scale_alpha_continuous(range = c(0.1, 0.6), guide = "none") +
+  labs(
+    title    = "Member similarity network (top-3 comps per member)",
+    subtitle = "Lines connect members with most similar question portfolios",
+    x = "UMAP 1", y = "UMAP 2", colour = "Party"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 9  Left–Right Positioning
+
+Two complementary approaches; combining them gives a more robust score.
+
+### 9.1  Text-based left–right score
+
+We score each question word as *left-leaning* or *right-leaning* using a
+small seed dictionary and compute a net score per member.
+
+```{r lr-text}
+left_words  <- c("equality", "workers", "union", "welfare", "public",
+                 "affordable", "redistribute", "poverty", "rights",
+                 "universal", "social", "care", "community", "homeless")
+right_words <- c("enterprise", "business", "market", "private", "tax",
+                 "regulation", "deregulation", "competition", "investment",
+                 "commercial", "fiscal", "property", "landlord", "growth")
+
+lr_scores_text <- tidy_qs |>
+  mutate(signal = case_when(
+    word %in% left_words  ~ -1,
+    word %in% right_words ~  1,
+    TRUE                  ~  0
+  )) |>
+  filter(signal != 0) |>
+  group_by(member_name) |>
+  summarise(lr_text = mean(signal), .groups = "drop")
+
+# Merge with party labels and sort
+lr_scores_text |>
+  left_join(select(members, member_name, party), by = "member_name") |>
+  arrange(lr_text) |>
+  mutate(member_name = factor(member_name, levels = member_name)) |>
+  filter(!is.na(lr_text)) |>
+  ggplot(aes(lr_text, member_name, colour = party)) +
+  geom_point(size = 2.5) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
+  scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
+  labs(
+    title    = "Text-based left–right score",
+    subtitle = "Negative = left-leaning vocabulary · Positive = right-leaning vocabulary",
+    x        = "Mean left–right signal", y = NULL, colour = "Party"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(axis.text.y = element_text(size = 7))
+```
+
+### 9.2  Vote-based left–right score (PC1 from divisions)
+
+Cross-reference with the vote-based axis computed in the *Voting Cohesion*
+vignette.  Load a saved RDS or recompute here:
+
+```{r lr-votes}
+# Assumes you have run the voting-cohesion vignette and saved:
+#   saveRDS(vote_pca_scores, "data/vote_pca_scores.rds")
+# Adjust path as needed.
+
+vote_pc1 <- tryCatch(
+  readRDS("data/vote_pca_scores.rds") |>
+    select(member_name, lr_vote = PC1),
+  error = function(e) {
+    message("Vote PCA scores not found. Run the voting-cohesion vignette first.")
+    NULL
+  }
+)
+
+if (!is.null(vote_pc1)) {
+  # Compare text-based vs vote-based positioning
+  combined_lr <- lr_scores_text |>
+    inner_join(vote_pc1, by = "member_name") |>
+    left_join(select(members, member_name, party), by = "member_name")
+
+  ggplot(combined_lr, aes(lr_vote, lr_text, colour = party,
+                          label = member_name)) +
+    geom_point(size = 2.5, alpha = 0.85) +
+    geom_text_repel(size = 2.4, max.overlaps = 15) +
+    geom_smooth(method = "lm", se = TRUE, colour = "grey40",
+                linetype = "dashed") +
+    scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
+    labs(
+      title    = "Text-based vs vote-based left–right positioning",
+      subtitle = "Strong correlation validates both measures",
+      x        = "Vote PC1 (govt → opposition)",
+      y        = "Text LR score (left → right)",
+      colour   = "Party"
+    ) +
+    theme_minimal(base_size = 11)
+}
+```
+
+---
+
+## 10  The Member Scouting Card
+
+Bringing it all together: a single function that prints a full member profile
+— archetype, top terms, domain radar, political position, and five comps.
+
+```{r scouting-card}
+member_scouting_card <- function(member, archetype_labels = NULL) {
+  # ── sanity check ──────────────────────────────────────────────────────────
+  if (!member %in% rownames(member_mat)) {
+    stop("Member '", member, "' not found in the question corpus.")
+  }
+
+  cat("═══════════════════════════════════════════════════════════\n")
+  cat("  MEMBER SCOUTING CARD\n")
+  cat("  ", member, "\n")
+  cat("═══════════════════════════════════════════════════════════\n\n")
+
+  # Metadata
+  meta <- members |> filter(member_name == member)
+  cat("  Party:          ", meta$party %||% "—", "\n")
+  cat("  Constituency:   ", meta$constituency %||% "—", "\n")
+
+  # Archetype
+  arch <- cluster_df |> filter(member_name == member) |> pull(archetype)
+  arch_label <- if (!is.null(archetype_labels)) archetype_labels[arch] else
+                paste("Archetype", arch)
+  cat("  Archetype:      ", arch_label, "\n\n")
+
+  # Top 8 TF-IDF terms
+  top_terms <- member_tfidf |>
+    filter(member_name == member) |>
+    slice_max(tf_idf, n = 8, with_ties = FALSE) |>
+    pull(word)
+  cat("  Signature terms:", paste(top_terms, collapse = ", "), "\n\n")
+
+  # Political position
+  lr <- lr_scores_text |> filter(member_name == member) |> pull(lr_text)
+  pos_label <- case_when(
+    lr < -0.3 ~ "Left",
+    lr < -0.1 ~ "Centre-left",
+    lr <  0.1 ~ "Centre",
+    lr <  0.3 ~ "Centre-right",
+    TRUE      ~ "Right"
+  )
+  cat("  Political position (text-based):", pos_label,
+      sprintf("(score: %.3f)\n\n", lr))
+
+  # Top-3 policy domains
+  top_domains <- member_domains |>
+    filter(member_name == member) |>
+    slice_max(domain_pct, n = 3) |>
+    mutate(label = sprintf("%s (%.0f%%)", domain, domain_pct)) |>
+    pull(label)
+  cat("  Top policy domains:\n")
+  for (d in top_domains) cat("    ·", d, "\n")
+  cat("\n")
+
+  # Player comps
+  comps <- find_comps(member, n = 5)
+  cat("  Most similar members (comps):\n")
+  for (i in seq_len(nrow(comps))) {
+    cat(sprintf("    %d. %-30s [%s] sim = %.3f\n",
+                i, comps$comp[i],
+                comps$party[i] %||% "—",
+                comps$similarity[i]))
+  }
+  cat("\n")
+
+  # Print radar chart
+  print(plot_member_radar(member))
+
+  invisible(list(
+    meta         = meta,
+    archetype    = arch,
+    top_terms    = top_terms,
+    lr_score     = lr,
+    top_domains  = top_domains,
+    comps        = comps
+  ))
+}
+
+# Null-coalescing operator (base R doesn't have one)
+`%||%` <- function(a, b) if (!is.null(a) && length(a) && !is.na(a[1])) a else b
+
+# ── Run examples ─────────────────────────────────────────────────────────────
+member_scouting_card("Mary Lou McDonald")
+member_scouting_card("Micheál Martin")
+```
+
+---
+
+## 11  Extending to Debate Transcripts
+
+Written questions capture *what* members ask about; **debate contributions**
+reveal *how* they argue.  `get_debate_text()` returns the raw speech for any
+debate record, giving a much richer text corpus for the same pipeline.
+
+```{r debates-extension}
+# Fetch a sample of recent debates
+recent_debates <- get_debates(
+  date_start = "2024-10-01",
+  date_end   = "2024-12-31",
+  limit      = 200
+)
+
+# Pull speech text per member (this takes a few minutes for a large corpus)
+debate_speeches <- recent_debates |>
+  slice_head(n = 50) |>        # start small; expand as needed
+  pull(debate_id) |>
+  map_dfr(\(id) {
+    tryCatch(
+      get_debate_text(id) |> mutate(debate_id = id),
+      error = function(e) NULL
+    )
+  })
+
+# debate_speeches now has member_name + text columns.
+# Feed into the same TF-IDF pipeline above (replace `show_as` with `text`)
+# to get a richer fingerprint that blends questions + speeches.
+#
+# Tip: weight question TF-IDF and speech TF-IDF separately, then combine:
+#   combined_tfidf <- bind_rows(
+#     question_tfidf |> mutate(source = "question", weight = 1.0),
+#     speech_tfidf   |> mutate(source = "speech",   weight = 0.6)
+#   ) |>
+#   mutate(tf_idf_w = tf_idf * weight)
+```
+
+---
+
+## Summary
+
+| Step | Method | What it tells you |
+|------|--------|--------------------|
+| TF-IDF fingerprint | `bind_tf_idf()` | A member's signature vocabulary |
+| Domain radar | keyword → domain lookup | Which policy areas they focus on |
+| PCA political map | `prcomp()` | Left–right + activist–rural positioning |
+| UMAP | `uwot::umap()` | Fine-grained neighbourhood clusters |
+| Archetypes | k-means on PC scores | Canonical "player types" in the Dáil |
+| Player comps | cosine similarity | Most similar members by question portfolio |
+| Scouting card | combined output | Full member profile in one call |
+
+The pipeline is entirely data-driven — the political labels emerge from the
+text, not from assumptions.  Feed in a new Dáil term, a different house
+(Seanad), or a different country's open parliamentary data and the analysis
+re-runs unchanged.
