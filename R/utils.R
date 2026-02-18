@@ -1,36 +1,183 @@
 #' @keywords internal
-.oireachtas_base_url <- "https://api.oireachtas.ie/v1"
+.oireachtas_base_url  <- "https://api.oireachtas.ie/v1"
 
-#' Make a GET request to the Oireachtas API
-#'
-#' @param endpoint Character. API endpoint path (e.g., `"/members"`).
-#' @param params Named list of query parameters.
-#' @param user_agent Character. User-agent string sent with every request.
-#'
-#' @return A parsed list representing the JSON response body.
 #' @keywords internal
-.oir_get <- function(endpoint, params = list(), user_agent = "oiReachtas R package") {
-  url <- paste0(.oireachtas_base_url, endpoint)
+.oireachtas_data_url  <- "https://data.oireachtas.ie"
 
-  # Remove NULL values from params
+# ---------------------------------------------------------------------------
+# Raw HTTP layer (with retry / backoff)
+# ---------------------------------------------------------------------------
+
+#' Make a GET request to the Oireachtas API, with retry on transient errors
+#'
+#' Retries on HTTP 429 (rate limit) and 5xx (server error) responses using
+#' exponential backoff.  The number of retries and the initial wait time are
+#' controlled by `options("oiReachtas.max_retries")` (default 4) and
+#' `options("oiReachtas.retry_wait")` (default 1 second).
+#'
+#' @param endpoint Character. API path (e.g. `"/members"`).
+#' @param params Named list of query parameters.
+#' @param ua Character. User-agent string.
+#'
+#' @return Parsed JSON as a list.
+#' @keywords internal
+.oir_get_raw <- function(endpoint,
+                         params   = list(),
+                         ua       = "oiReachtas R package") {
+  url    <- paste0(.oireachtas_base_url, endpoint)
   params <- Filter(Negate(is.null), params)
 
-  resp <- httr::GET(
-    url,
-    query = params,
-    httr::user_agent(user_agent),
-    httr::accept_json()
-  )
+  max_retries <- getOption("oiReachtas.max_retries", 4L)
+  wait        <- getOption("oiReachtas.retry_wait",  1)   # seconds
 
-  .oir_check_response(resp)
+  for (attempt in seq_len(max_retries + 1L)) {
+    resp <- tryCatch(
+      httr::GET(url,
+                query  = params,
+                httr::user_agent(ua),
+                httr::accept_json()),
+      error = function(e) {
+        if (attempt > max_retries) rlang::abort(
+          paste0("Network error after ", max_retries, " retries: ", conditionMessage(e)),
+          class = "oireachtas_network_error"
+        )
+        NULL
+      }
+    )
 
-  jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8"),
-                     simplifyVector = FALSE)
+    # Network failure (resp is NULL) → back off and retry
+    if (is.null(resp)) {
+      .oir_backoff(attempt, wait)
+      wait <- wait * 2
+      next
+    }
+
+    status <- httr::status_code(resp)
+
+    # Success
+    if (status < 400L) {
+      return(jsonlite::fromJSON(
+        httr::content(resp, as = "text", encoding = "UTF-8"),
+        simplifyVector = FALSE
+      ))
+    }
+
+    # Retryable: 429 (rate limit) or transient 5xx
+    retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
+    if (retryable && attempt <= max_retries) {
+      retry_after <- suppressWarnings(
+        as.numeric(httr::headers(resp)[["retry-after"]])
+      )
+      sleep_for <- if (!is.na(retry_after) && retry_after > 0) retry_after else wait
+      message(sprintf(
+        "[oiReachtas] HTTP %d – retrying in %.0fs (attempt %d/%d)",
+        status, sleep_for, attempt, max_retries
+      ))
+      Sys.sleep(sleep_for)
+      wait <- wait * 2
+      next
+    }
+
+    # Non-retryable or exhausted retries → throw
+    .oir_check_response(resp)
+  }
 }
 
-#' Check an httr response for errors
+#' Exponential back-off helper
+#' @keywords internal
+.oir_backoff <- function(attempt, wait) {
+  message(sprintf(
+    "[oiReachtas] Network error – retrying in %.0fs (attempt %d)",
+    wait, attempt
+  ))
+  Sys.sleep(wait)
+}
+
+# ---------------------------------------------------------------------------
+# Memoised public-facing GET (initialised in .onLoad)
+# ---------------------------------------------------------------------------
+
+# Placeholder overwritten by .onLoad
+#' @keywords internal
+.oir_get <- NULL
+
+# ---------------------------------------------------------------------------
+# XML GET (also memoised)
+# ---------------------------------------------------------------------------
+
+#' Fetch an XML document from data.oireachtas.ie with retry
 #'
-#' @param resp An `httr` response object.
+#' @param uri Character. Full URL **or** a fragment path (prepended with
+#'   `.oireachtas_data_url` automatically).
+#' @keywords internal
+.oir_get_xml_raw <- function(uri) {
+  url <- if (grepl("^https?://", uri)) uri else paste0(.oireachtas_data_url, uri)
+
+  max_retries <- getOption("oiReachtas.max_retries", 4L)
+  wait        <- getOption("oiReachtas.retry_wait",  1)
+
+  for (attempt in seq_len(max_retries + 1L)) {
+    resp <- tryCatch(
+      httr::GET(url, httr::user_agent("oiReachtas R package"),
+                httr::accept("application/xml")),
+      error = function(e) {
+        if (attempt > max_retries) rlang::abort(
+          paste0("Network error fetching XML: ", conditionMessage(e)),
+          class = "oireachtas_network_error"
+        )
+        NULL
+      }
+    )
+
+    if (is.null(resp)) {
+      .oir_backoff(attempt, wait); wait <- wait * 2; next
+    }
+
+    status <- httr::status_code(resp)
+    if (status < 400L) return(xml2::read_xml(httr::content(resp, as = "raw")))
+
+    retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
+    if (retryable && attempt <= max_retries) {
+      retry_after <- suppressWarnings(as.numeric(httr::headers(resp)[["retry-after"]]))
+      sleep_for <- if (!is.na(retry_after) && retry_after > 0) retry_after else wait
+      message(sprintf("[oiReachtas] HTTP %d – retrying XML fetch in %.0fs", status, sleep_for))
+      Sys.sleep(sleep_for); wait <- wait * 2; next
+    }
+
+    .oir_check_response(resp)
+  }
+}
+
+#' @keywords internal
+.oir_get_xml <- NULL  # overwritten in .onLoad
+
+# ---------------------------------------------------------------------------
+# .onLoad: wire up memoised wrappers
+# ---------------------------------------------------------------------------
+
+#' @keywords internal
+.oir_cache <- NULL  # overwritten in .onLoad
+
+.onLoad <- function(libname, pkgname) {
+  max_age <- getOption("oiReachtas.cache_max_age", 3600)  # seconds; 0 = disabled
+
+  cache <- if (max_age > 0) {
+    cachem::cache_mem(max_age = max_age)
+  } else {
+    cachem::cache_null()
+  }
+
+  # Assign into the package namespace so other functions can reach it
+  ns <- asNamespace(pkgname)
+  assign(".oir_cache",       cache,                                     envir = ns)
+  assign(".oir_get",         memoise::memoise(.oir_get_raw, cache = cache), envir = ns)
+  assign(".oir_get_xml",     memoise::memoise(.oir_get_xml_raw, cache = cache), envir = ns)
+}
+
+# ---------------------------------------------------------------------------
+# Shared response checker
+# ---------------------------------------------------------------------------
+
 #' @keywords internal
 .oir_check_response <- function(resp) {
   if (httr::http_error(resp)) {
@@ -39,29 +186,25 @@
       jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8")),
       error = function(e) list(message = httr::http_status(resp)$message)
     )
-    msg <- if (!is.null(body$message)) body$message else httr::http_status(resp)$message
+    msg <- body$message %||% httr::http_status(resp)$message
     rlang::abort(
       paste0("Oireachtas API error [HTTP ", status, "]: ", msg),
       class = "oireachtas_api_error",
       status = status,
-      body = body
+      body   = body
     )
   }
 }
 
-#' Build common pagination parameters
-#'
-#' @param limit Integer. Maximum records to return (default 50, max 100).
-#' @param skip Integer. Number of records to skip (for pagination).
+# ---------------------------------------------------------------------------
+# Pagination helpers
+# ---------------------------------------------------------------------------
+
 #' @keywords internal
 .oir_pagination <- function(limit = 50L, skip = 0L) {
   list(limit = as.integer(limit), skip = as.integer(skip))
 }
 
-#' Validate a date string in YYYY-MM-DD format
-#'
-#' @param date Character or NULL.
-#' @param arg_name Character. Argument name for the error message.
 #' @keywords internal
 .oir_validate_date <- function(date, arg_name = "date") {
   if (is.null(date)) return(invisible(NULL))
@@ -74,31 +217,19 @@
   invisible(date)
 }
 
-#' Retrieve all pages of a paginated endpoint
-#'
-#' Automatically pages through results and returns a combined list.
-#'
-#' @param endpoint Character. API endpoint path.
-#' @param params Named list of fixed query parameters (excluding `skip`/`limit`).
-#' @param limit Integer. Page size (default 50).
-#' @param max_records Integer or Inf. Hard cap on total records fetched.
-#'
-#' @return A list of result items combined across all pages.
 #' @keywords internal
 .oir_get_all <- function(endpoint, params = list(), limit = 50L, max_records = Inf) {
   results <- list()
-  skip <- 0L
+  skip    <- 0L
 
   repeat {
     page_params <- c(params, .oir_pagination(limit = limit, skip = skip))
-    resp <- .oir_get(endpoint, page_params)
-
-    # Results are typically under resp$results$items
+    resp  <- .oir_get(endpoint, page_params)
     items <- tryCatch(resp$results$items, error = function(e) list())
     if (is.null(items)) items <- list()
 
     results <- c(results, items)
-    skip <- skip + length(items)
+    skip    <- skip + length(items)
 
     if (length(items) < limit || length(results) >= max_records) break
   }
