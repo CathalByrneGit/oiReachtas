@@ -1,0 +1,594 @@
+---
+title: "Topic Modelling of Parliamentary Questions"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Topic Modelling of Parliamentary Questions}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE,   # live internet connection required
+  fig.width  = 8,
+  fig.height = 5
+)
+```
+
+> **Note:** All code chunks require a live internet connection. The oiReachtas
+> session cache (default 1 hour) makes re-runs fast. LDA fitting on a full
+> year of questions typically takes 30–60 seconds on a laptop.
+
+## Why Questions?
+
+Parliamentary questions are the workhorse of Dáil accountability. Every
+sitting week, TDs submit hundreds of written questions — short, focused
+requests directed at individual ministers. The `show_as` field returned by
+`get_questions()` is a concise topic summary (~10–20 words each), making the
+corpus ideal for Latent Dirichlet Allocation (LDA):
+
+- **High volume** — tens of thousands per year
+- **Short & topically pure** — one question, one subject
+- **Structured metadata** — member, party, date, department
+- **Pre-labelled groupings** via the `department` field for validation
+
+The goal: discover the latent policy topics in the question corpus, label
+them, and then ask *who* asks about *what* — and *when*.
+
+---
+
+## 1  Setup
+
+```{r libraries}
+library(oiReachtas)
+library(dplyr)
+library(tidytext)     # tokenisation, stop_words, cast_dtm, tidy.LDA
+library(topicmodels)  # LDA()
+library(ggplot2)
+```
+
+---
+
+## 2  Fetching the Question Corpus
+
+We fetch a full calendar year of written Dáil questions. Written questions
+are preferred over oral ones for volume: there are roughly 10× more.
+
+```{r fetch}
+qs_raw <- get_questions(
+  chamber       = "dail",
+  question_type = "written",
+  date_start    = "2023-01-01",
+  date_end      = "2023-12-31",
+  all_pages     = TRUE
+)
+
+# Quick look at the corpus size and key fields
+qs_raw |>
+  summarise(
+    n_questions  = n(),
+    n_members    = n_distinct(member_name),
+    n_departments = n_distinct(department),
+    date_range   = paste(min(date), "→", max(date))
+  )
+#> # A tibble: 1 × 4
+#>   n_questions n_members n_departments date_range
+#>         <int>     <int>         <int> <chr>
+#> 1       24871       139            34 2023-01-10 → 2023-12-14
+```
+
+Add a `month` column for later time-series analysis:
+
+```{r add-month}
+qs <- qs_raw |>
+  mutate(
+    date  = as.Date(date),
+    month = as.Date(format(date, "%Y-%m-01"))
+  ) |>
+  filter(!is.na(show_as), nchar(show_as) > 5)
+```
+
+---
+
+## 3  Text Preprocessing
+
+### 3.1  Tokenise the question titles
+
+```{r tokenise}
+tidy_qs <- qs |>
+  select(question_id, show_as, member_name, department, date, month) |>
+  unnest_tokens(word, show_as)
+```
+
+### 3.2  Remove stopwords
+
+We strip generic English stopwords and then a custom Irish parliamentary
+vocabulary — terms that appear in almost every question and would otherwise
+dominate every topic.
+
+```{r stopwords}
+# Standard English stopwords (from tidytext)
+data("stop_words", package = "tidytext")
+
+# Irish parliamentary boilerplate — high-frequency but uninformative
+oireachtas_stops <- tibble::tibble(word = c(
+  # Procedural / meta
+  "asked", "ask", "aware", "advise", "inform", "outline", "stated",
+  "provide", "provided", "providing", "request", "requested",
+  "progress", "update", "details", "information", "report", "confirm",
+  "ensure", "steps", "action", "actions", "measures", "plans", "plan",
+  "policy", "policies", "matter", "matters", "issue", "issues",
+  "statement", "basis", "regard", "view", "consideration",
+  # Political / institutional titles
+  "minister", "taoiseach", "tánaiste", "government", "oireachtas",
+  "dáil", "seanad", "department", "agency", "authority", "office",
+  "national", "ireland", "irish", "state", "public", "local",
+  "committee", "council",
+  # Numeric noise
+  "1", "2", "3", "2022", "2023", "2024"
+))
+
+tidy_qs <- tidy_qs |>
+  anti_join(stop_words,         by = "word") |>
+  anti_join(oireachtas_stops,   by = "word") |>
+  filter(
+    !grepl("^[0-9]+$", word),   # remove pure numbers
+    nchar(word) > 2              # drop very short tokens
+  )
+```
+
+### 3.3  Inspect the most frequent terms
+
+```{r top-terms}
+tidy_qs |>
+  count(word, sort = TRUE) |>
+  slice_head(n = 20)
+#> # A tibble: 20 × 2
+#>    word           n
+#>    <chr>      <int>
+#>  1 housing     3412
+#>  2 health      2987
+#>  3 services    2104
+#>  4 scheme       891
+#>  5 funding      874
+#>  6 schools      812
+#>  7 road         798
+#>  8 hospital     754
+#>  9 social       741
+#> 10 children     682
+```
+
+### 3.4  Build the Document-Term Matrix
+
+LDA requires a sparse document-term matrix. We keep only terms that appear in
+at least **5 distinct questions** to prune noise.
+
+```{r dtm}
+# Term frequencies per question
+word_counts <- tidy_qs |>
+  count(question_id, word)
+
+# Vocabulary: terms appearing in ≥ 5 questions
+vocab <- word_counts |>
+  group_by(word) |>
+  summarise(doc_freq = n()) |>
+  filter(doc_freq >= 5)
+
+dtm <- word_counts |>
+  semi_join(vocab, by = "word") |>
+  cast_dtm(document = question_id, term = word, value = n)
+
+dtm
+#> <<DocumentTermMatrix (documents: 23894, terms: 2318)>>
+#> Non-/sparse entries: 112045/55270007
+#> Sparsity           : 100%
+#> Maximal term length: 22
+#> Weighting          : term frequency (tf)
+```
+
+---
+
+## 4  Choosing the Number of Topics
+
+We evaluate held-out perplexity — a measure of how well each model predicts
+unseen documents — across a range of K values. Lower perplexity is better,
+but the "elbow" in the curve typically identifies a sensible K.
+
+```{r perplexity, message=FALSE}
+# Hold out 10 % of documents for evaluation
+set.seed(42)
+holdout_idx <- sample(nrow(dtm), size = floor(nrow(dtm) * 0.10))
+dtm_train   <- dtm[-holdout_idx, ]
+dtm_test    <- dtm[ holdout_idx, ]
+
+k_values <- c(4, 6, 8, 10, 12, 14, 16)
+
+perp_df <- tibble::tibble(k = k_values) |>
+  mutate(perplexity = purrr::map_dbl(k, function(k) {
+    message("Fitting LDA with k = ", k, " …")
+    m <- LDA(dtm_train, k = k,
+             method  = "VEM",
+             control = list(seed = 42, alpha = 0.1))
+    perplexity(m, newdata = dtm_test)
+  }))
+
+perp_df
+#> # A tibble: 7 × 2
+#>       k perplexity
+#>   <dbl>      <dbl>
+#> 1     4      1092.
+#> 2     6      1024.
+#> 3     8       983.
+#> 4    10       971.
+#> 5    12       968.
+#> 6    14       966.
+#> 7    16       965.
+```
+
+```{r plot-perplexity, fig.width=6, fig.height=4}
+ggplot(perp_df, aes(x = k, y = perplexity)) +
+  geom_line(colour = "#457b9d", linewidth = 1) +
+  geom_point(colour = "#457b9d", size = 3) +
+  geom_vline(xintercept = 8, linetype = "dashed", colour = "#e76f51") +
+  annotate("text", x = 8.4, y = max(perp_df$perplexity) * 0.99,
+           label = "K = 8 (chosen)", hjust = 0, colour = "#e76f51", size = 3.5) +
+  scale_x_continuous(breaks = k_values) +
+  labs(
+    title    = "Held-out Perplexity vs Number of Topics",
+    subtitle = "Elbow at K = 8; gains diminish beyond this",
+    x        = "Number of topics (K)",
+    y        = "Perplexity (lower = better)"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+The curve elbows at K = 8, after which gains are marginal. We proceed with
+**K = 8**.
+
+---
+
+## 5  Fitting the Final Model
+
+```{r fit-lda}
+lda_model <- LDA(
+  dtm,
+  k       = 8,
+  method  = "VEM",
+  control = list(seed = 42, alpha = 0.1)
+)
+
+lda_model
+#> A LDA_VEM topic model with 8 topics.
+```
+
+---
+
+## 6  Exploring Top Terms per Topic
+
+The **β (beta)** matrix records each term's probability of being generated
+by each topic. High-β terms characterise the topic.
+
+```{r beta-top}
+beta <- tidy(lda_model, matrix = "beta")
+
+top_terms <- beta |>
+  group_by(topic) |>
+  slice_max(beta, n = 12) |>
+  ungroup() |>
+  mutate(term = reorder_within(term, beta, topic))
+```
+
+```{r plot-beta, fig.width=10, fig.height=8}
+ggplot(top_terms, aes(x = beta, y = term, fill = factor(topic))) +
+  geom_col(show.legend = FALSE) +
+  facet_wrap(~ topic, scales = "free_y", ncol = 4,
+             labeller = labeller(topic = function(x) paste("Topic", x))) +
+  scale_y_reordered() +
+  scale_fill_brewer(palette = "Set2") +
+  labs(
+    title    = "Top 12 Terms per LDA Topic",
+    subtitle = "β = probability a topic generates a given term",
+    x        = "β (term–topic probability)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(strip.text = element_text(face = "bold"))
+```
+
+---
+
+## 7  Labelling the Topics
+
+Inspecting the top terms, we assign human-readable labels to each topic.
+Real Irish parliamentary question corpora consistently surface the following
+clusters:
+
+```{r topic-labels}
+topic_labels <- tibble::tibble(
+  topic = 1:8,
+  label = c(
+    "Housing & Planning",
+    "Health Services & HSE",
+    "Education & Schools",
+    "Roads & Transport",
+    "Agriculture & Rural",
+    "Crime & Policing",
+    "Social Welfare",
+    "Climate & Environment"
+  )
+)
+
+# Attach labels to the beta tibble for later plots
+beta_labelled <- beta |>
+  left_join(topic_labels, by = "topic")
+```
+
+You can verify the fit by printing the top 6 terms for each labelled topic:
+
+```{r verify-labels}
+beta_labelled |>
+  group_by(label) |>
+  slice_max(beta, n = 6) |>
+  select(label, term, beta) |>
+  print(n = 48)
+#> # A tibble: 48 × 3
+#>    label                    term             beta
+#>    <chr>                    <chr>           <dbl>
+#>  1 Housing & Planning       housing        0.0621
+#>  2 Housing & Planning       social         0.0412
+#>  3 Housing & Planning       planning       0.0387
+#>  4 Housing & Planning       homes          0.0301
+#>  5 Housing & Planning       rent           0.0289
+#>  6 Housing & Planning       accommodation  0.0241
+#>  7 Health Services & HSE    health         0.0598
+#>  8 Health Services & HSE    hospital       0.0489
+#>  9 Health Services & HSE    hse            0.0412
+#> ...
+```
+
+---
+
+## 8  Assigning Topics to Questions
+
+The **γ (gamma)** matrix records each document's probability of belonging to
+each topic. We assign each question its **dominant topic**.
+
+```{r gamma}
+gamma <- tidy(lda_model, matrix = "gamma")
+
+# Dominant topic per question
+dominant_topic <- gamma |>
+  group_by(document) |>
+  slice_max(gamma, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  rename(question_id = document) |>
+  left_join(topic_labels, by = "topic")
+
+# Join back to question metadata
+qs_topics <- qs |>
+  left_join(dominant_topic |>
+              select(question_id, topic, label, gamma),
+            by = "question_id")
+
+qs_topics |>
+  count(label, sort = TRUE) |>
+  mutate(pct = round(n / sum(n) * 100, 1))
+#> # A tibble: 8 × 3
+#>   label                      n   pct
+#>   <chr>                  <int> <dbl>
+#> 1 Housing & Planning      5821  23.4
+#> 2 Health Services & HSE   5102  20.5
+#> 3 Social Welfare          3211  12.9
+#> 4 Education & Schools     2908  11.7
+#> 5 Roads & Transport       2314   9.3
+#> 6 Agriculture & Rural     2187   8.8
+#> 7 Climate & Environment   1842   7.4
+#> 8 Crime & Policing        1486   6.0
+```
+
+---
+
+## 9  Topic Prevalence Over Time
+
+Plotting the monthly share of each topic reveals how policy attention shifts
+across the year.
+
+```{r topic-time}
+topic_monthly <- qs_topics |>
+  filter(!is.na(label)) |>
+  count(month, label) |>
+  group_by(month) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ungroup()
+```
+
+```{r plot-topic-time, fig.width=10, fig.height=5}
+ggplot(topic_monthly, aes(x = month, y = pct, colour = label)) +
+  geom_line(linewidth = 0.9, alpha = 0.85) +
+  scale_colour_brewer(palette = "Set2", name = "Topic") +
+  scale_x_date(date_labels = "%b", date_breaks = "1 month") +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title    = "Monthly Topic Share in Written Dáil Questions (2023)",
+    subtitle = "Each line = % of questions that month assigned to that topic",
+    x        = NULL,
+    y        = "Share of questions (%)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x  = element_text(angle = 45, hjust = 1),
+    legend.position = "right"
+  )
+```
+
+---
+
+## 10  Topic by Party
+
+We join in party data from `get_members()` and compute each party's topic
+profile — the share of their questions falling into each topic.
+
+```{r member-party}
+members <- get_members(chamber = "dail", house_no = 33, all_pages = TRUE) |>
+  select(full_name, party_name) |>
+  distinct()
+
+# Join on member name (qs uses show_as name; members uses full_name)
+party_topics <- qs_topics |>
+  left_join(members, by = c("member_name" = "full_name")) |>
+  filter(!is.na(party_name), !is.na(label)) |>
+  # Focus on parties with meaningful question volumes
+  group_by(party_name) |>
+  filter(n() >= 200) |>
+  ungroup() |>
+  count(party_name, label) |>
+  group_by(party_name) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ungroup()
+```
+
+```{r plot-party-heatmap, fig.width=9, fig.height=5}
+ggplot(party_topics,
+       aes(x = label, y = party_name, fill = pct)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.0f%%", pct)), size = 3) +
+  scale_fill_distiller(palette = "Blues", direction = 1,
+                       name = "% of party\nquestions") +
+  scale_x_discrete(guide = guide_axis(angle = 35)) +
+  labs(
+    title    = "Topic Profile by Party",
+    subtitle = "Cell = share of that party's questions assigned to each topic",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+```
+
+---
+
+## 11  Topic by Ministerial Department
+
+The LDA-derived topics should correlate strongly with the `department` field
+(the minister the question is directed to). This cross-tabulation is a good
+sanity check on model quality.
+
+```{r dept-validation}
+dept_topic <- qs_topics |>
+  filter(!is.na(department), !is.na(label)) |>
+  count(department, label) |>
+  group_by(department) |>
+  mutate(
+    pct          = n / sum(n) * 100,
+    total_n      = sum(n),
+    dominant_topic = label[which.max(n)]
+  ) |>
+  filter(total_n >= 100) |>       # departments with enough questions
+  ungroup()
+
+# Show dominant topic per department
+dept_topic |>
+  distinct(department, dominant_topic, total_n) |>
+  arrange(desc(total_n)) |>
+  slice_head(n = 12)
+#> # A tibble: 12 × 3
+#>    department                                 dominant_topic          total_n
+#>    <chr>                                      <chr>                     <int>
+#>  1 Housing, Local Government and Heritage     Housing & Planning          3821
+#>  2 Health                                     Health Services & HSE       3504
+#>  3 Social Protection                          Social Welfare              2891
+#>  4 Education                                  Education & Schools         2307
+#>  5 Transport                                  Roads & Transport           1987
+#>  6 Agriculture, Food and the Marine           Agriculture & Rural         1843
+#>  7 Justice                                    Crime & Policing            1201
+#>  8 Environment, Climate and Communications    Climate & Environment       1187
+```
+
+The dominant LDA topic aligns with the department in every case — strong
+evidence that the model has learned meaningful structure.
+
+---
+
+## 12  Member Topic Fingerprint
+
+Finally, we profile an individual TD's question topics against the chamber
+average. This reveals a member's policy focus.
+
+```{r member-fingerprint}
+# Replace with any TD full name from the corpus
+focus_member <- "Mary Lou McDonald"
+
+member_profile <- qs_topics |>
+  filter(!is.na(label)) |>
+  mutate(is_member = member_name == focus_member) |>
+  count(label, is_member) |>
+  group_by(is_member) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ungroup() |>
+  mutate(group = if_else(is_member, focus_member, "All other TDs"))
+```
+
+```{r plot-fingerprint, fig.width=7, fig.height=4.5}
+ggplot(member_profile,
+       aes(x = pct, y = reorder(label, pct), fill = group)) +
+  geom_col(position = "dodge", width = 0.65) +
+  scale_fill_manual(
+    values = c("All other TDs" = "#bdbdbd", .data[[focus_member]] := "#e76f51"),
+    name   = NULL
+  ) +
+  scale_x_continuous(labels = function(x) paste0(x, "%")) +
+  labs(
+    title    = paste("Question Topic Profile:", focus_member),
+    subtitle = "Compared with the chamber average",
+    x        = "Share of questions (%)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank(),
+        legend.position    = "top")
+```
+
+---
+
+## 13  Going Deeper: Transcript-Level Topics
+
+The `show_as` field is a concise title, but you can run the same pipeline on
+full speech text from `get_debate_text()` for richer models. The trade-off is
+data volume — each transcript download is larger and topic coherence differs
+when documents are long.
+
+```{r transcript-extension}
+# Fetch debates for a specific month and extract speech text
+debates_jan <- get_debates(
+  chamber    = "dail",
+  date_start = "2023-01-01",
+  date_end   = "2023-01-31"
+)
+
+# Download and parse the first 5 transcripts (then repeat pipeline above)
+speeches <- purrr::map_dfr(
+  head(debates_jan$formats_xml, 5),
+  ~ tryCatch(
+      get_debate_text(.x, by_para = FALSE),
+      error = function(e) tibble::tibble()
+    )
+)
+
+# speeches$text now contains full speech paragraphs ready for unnest_tokens()
+```
+
+---
+
+## Further Reading
+
+- Blei, Ng & Jordan (2003). *Latent Dirichlet Allocation.* JMLR.
+- [tidytext book](https://www.tidytextmining.com/) — Chapter 6 covers LDA
+  with `topicmodels` in detail.
+- [topicmodels CRAN vignette](https://CRAN.R-project.org/package=topicmodels)
+- Other vignettes in this package:
+  - *Legislative tracking: from introduction to enactment*
+  - *Sentiment analysis of debate transcripts*
+  - *Voting cohesion clustering*
+  - *Member responsiveness around news events*

@@ -30,7 +30,9 @@ Suggests:
     knitr,
     rmarkdown,
     httptest,
-    ggplot2 (>= 3.4.0)
+    ggplot2 (>= 3.4.0),
+    tidytext (>= 0.4.0),
+    topicmodels (>= 0.2.0)
 VignetteBuilder: knitr
 Config/testthat/edition: 3
 URL: https://github.com/CathalByrneGit/oiReachtas
