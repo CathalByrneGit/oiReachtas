@@ -1,0 +1,496 @@
+---
+title: "Legislative Tracking: From Introduction to Enactment"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Legislative Tracking: From Introduction to Enactment}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  eval      = FALSE   # all chunks require a live internet connection
+)
+```
+
+> **Note:** Every code block in this vignette makes live API calls. Run them
+> interactively in an R session with an internet connection. Results are cached
+> for one hour by default, so re-running a script is fast.
+
+## The Irish Legislative Process
+
+A bill in Ireland travels through a fixed series of stages before it can
+become law:
+
+```
+                    Dáil Éireann                    Seanad Éireann
+ ┌──────────────────────────────────┐  ┌──────────────────────────────────┐
+ │ 1st Reading  (formal intro)      │  │ 1st Reading                      │
+ │ 2nd Reading  (principle debate)  │─▶│ 2nd Reading                      │
+ │ Committee    (line-by-line)      │  │ Committee                        │
+ │ Report Stage (amendments)        │  │ Report Stage                     │
+ │ 5th Stage    (final vote)        │  │ 5th Stage                        │
+ └──────────────────────────────────┘  └──────────────────────────────────┘
+                                                       │
+                                             Presidential Assent
+                                                       │
+                                                     ACT ✓
+```
+
+Government Bills are introduced by a minister; Private Members' Bills (PMBs)
+are introduced by individual TDs or Senators. Only a fraction of PMBs are
+ever enacted.
+
+The Oireachtas Open Data API records the **current status** of every bill and,
+for enacted legislation, the **Act number** and **year**. We can use these to
+build a full-lifecycle view.
+
+---
+
+## 1  Setup
+
+```{r libraries}
+library(oiReachtas)
+library(dplyr)
+library(ggplot2)
+```
+
+---
+
+## 2  Fetching the Legislation Corpus
+
+### 2.1  A snapshot of the current Dáil
+
+Bills before the 33rd Dáil (dissolved in 2025) span a representative modern
+period. We fetch the complete set — the session cache means subsequent calls
+are instant.
+
+```{r fetch-all}
+legs_33 <- get_legislation(house_no = 33, all_pages = TRUE)
+
+glimpse(legs_33)
+#> Rows: 412
+#> Columns: 12
+#> $ bill_id         <chr> "/ie/oireachtas/bill/2020/2", …
+#> $ bill_no         <chr> "2", "7", …
+#> $ bill_year       <chr> "2020", "2020", …
+#> $ bill_type       <chr> "Government", "Private Members'", …
+#> $ bill_status     <chr> "Enacted", "Lapsed", …
+#> $ title           <chr> "Criminal Justice (Money Laundering …", …
+#> $ title_ga        <chr> NA, NA, …
+#> $ chamber         <chr> "Dáil Éireann", "Seanad Éireann", …
+#> $ sponsor_name    <chr> "Minister for Justice", "Rónán Mullen", …
+#> $ date_introduced <chr> "2020-02-06", …
+#> $ act_no          <chr> "9", NA, …
+#> $ act_year        <chr> "2021", NA, …
+```
+
+---
+
+## 3  The Status Pipeline
+
+Most bills never reach the statute book. Visualising the pipeline makes this
+stark.
+
+```{r status-order}
+# Define a meaningful reading order for the y-axis
+status_levels <- c(
+  "Current", "Enacted", "Defeated", "Withdrawn", "Lapsed"
+)
+
+status_counts <- legs_33 |>
+  count(bill_status, name = "n_bills") |>
+  mutate(
+    bill_status = factor(bill_status, levels = rev(status_levels)),
+    label       = as.character(n_bills)
+  ) |>
+  arrange(bill_status)
+```
+
+```{r plot-pipeline, fig.width=7, fig.height=4}
+ggplot(status_counts, aes(x = n_bills, y = bill_status, fill = bill_status)) +
+  geom_col(show.legend = FALSE, width = 0.65) +
+  geom_text(aes(label = label), hjust = -0.2, size = 3.5) +
+  scale_fill_manual(values = c(
+    "Enacted"   = "#2a9d8f",
+    "Current"   = "#457b9d",
+    "Defeated"  = "#e76f51",
+    "Withdrawn" = "#f4a261",
+    "Lapsed"    = "#bdbdbd"
+  )) +
+  scale_x_continuous(expand = expansion(mult = c(0, 0.15))) +
+  labs(
+    title    = "33rd Dáil: Bills by Final Status",
+    subtitle = "Most private members' bills lapse or are withdrawn",
+    x        = "Number of bills",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+---
+
+## 4  Government vs Private Members' Bills
+
+```{r bill-type-status}
+type_status <- legs_33 |>
+  filter(!is.na(bill_type)) |>
+  count(bill_type, bill_status) |>
+  group_by(bill_type) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ungroup()
+```
+
+```{r plot-bill-type, fig.width=7, fig.height=4.5}
+outcome_palette <- c(
+  "Enacted"   = "#2a9d8f",
+  "Current"   = "#457b9d",
+  "Defeated"  = "#e76f51",
+  "Withdrawn" = "#f4a261",
+  "Lapsed"    = "#bdbdbd"
+)
+
+ggplot(type_status,
+       aes(x = pct, y = bill_type, fill = bill_status)) +
+  geom_col(position = "stack", width = 0.5) +
+  scale_fill_manual(values = outcome_palette, name = "Status") +
+  scale_x_continuous(labels = function(x) paste0(x, "%"),
+                     expand = expansion(mult = c(0, 0.02))) +
+  labs(
+    title    = "Bill Outcomes by Type",
+    subtitle = "Government bills are far more likely to be enacted",
+    x        = "Share of bills (%)",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+---
+
+## 5  Time from Introduction to Enactment
+
+The API records `bill_year` (introduction) and `act_year` (enactment). Their
+difference gives a coarse measure of legislative duration.
+
+```{r enacted-duration}
+enacted <- legs_33 |>
+  filter(bill_status == "Enacted",
+         !is.na(bill_year), !is.na(act_year)) |>
+  mutate(
+    year_introduced = as.integer(bill_year),
+    year_enacted    = as.integer(act_year),
+    years_to_enact  = year_enacted - year_introduced
+  )
+
+enacted |>
+  summarise(
+    n          = n(),
+    min_yrs    = min(years_to_enact),
+    median_yrs = median(years_to_enact),
+    max_yrs    = max(years_to_enact)
+  )
+#> # A tibble: 1 × 4
+#>       n min_yrs median_yrs max_yrs
+#>   <int>   <int>      <dbl>   <int>
+#> 1    94       0          1       4
+```
+
+```{r plot-duration, fig.width=6, fig.height=4}
+ggplot(enacted, aes(x = years_to_enact, fill = bill_type)) +
+  geom_bar(position = "dodge") +
+  scale_fill_manual(
+    values = c("Government" = "#457b9d", "Private Members'" = "#e9c46a"),
+    name   = "Bill type"
+  ) +
+  scale_x_continuous(breaks = 0:6) +
+  labs(
+    title    = "Years from Introduction to Enactment",
+    subtitle = "Government bills typically pass within a year",
+    x        = "Years",
+    y        = "Number of bills"
+  ) +
+  theme_minimal(base_size = 13)
+```
+
+---
+
+## 6  Most Prolific Sponsors
+
+```{r top-sponsors}
+top_sponsors <- legs_33 |>
+  filter(!is.na(sponsor_name)) |>
+  count(sponsor_name, bill_type, name = "n_bills") |>
+  # Exclude generic government entries; keep individual names
+  filter(!grepl("^Minister|^Government", sponsor_name)) |>
+  slice_max(n_bills, n = 15) |>
+  mutate(sponsor_name = reorder(sponsor_name, n_bills))
+```
+
+```{r plot-sponsors, fig.width=7, fig.height=6}
+ggplot(top_sponsors,
+       aes(x = n_bills, y = sponsor_name, fill = bill_type)) +
+  geom_col(width = 0.65) +
+  scale_fill_manual(
+    values = c("Government" = "#457b9d", "Private Members'" = "#e9c46a"),
+    name   = "Type"
+  ) +
+  labs(
+    title = "Top 15 Bill Sponsors (33rd Dáil)",
+    x     = "Bills introduced",
+    y     = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+---
+
+## 7  Tracking a Specific Bill
+
+### 7.1  Look up by bill number and year
+
+```{r single-bill}
+# The Health (Miscellaneous Provisions) Bill 2022
+hmp <- get_legislation(bill_no = 65, bill_year = 2022)
+
+hmp |> select(title, bill_type, bill_status, sponsor_name,
+              date_introduced, act_no, act_year)
+#> # A tibble: 1 × 7
+#>   title                           bill_type  bill_status sponsor_name
+#>   <chr>                           <chr>      <chr>       <chr>
+#> 1 Health (Miscellaneous Provis… Government  Enacted     Minister for Health
+#>   date_introduced act_no act_year
+#>   <chr>           <chr>  <chr>
+#> 1 2022-10-18      6      2023
+```
+
+### 7.2  Find debates on the bill
+
+Once you have the bill title, search for debates mentioning it. The
+`get_debates()` endpoint can be filtered by date; combining that with
+`get_debate_text()` lets you read the actual floor speeches.
+
+```{r bill-debates}
+# Debates from when the bill was active
+bill_debates <- get_debates(
+  chamber    = "dail",
+  date_start = "2022-10-01",
+  date_end   = "2023-06-30"
+)
+
+# The division subject field often contains the bill short title
+bill_debates |>
+  filter(grepl("Health.*Miscellaneous", section_title, ignore.case = TRUE)) |>
+  select(date, section_title, formats_xml) |>
+  head(5)
+```
+
+### 7.3  Read the transcript of the Second Stage debate
+
+```{r bill-transcript}
+# Use the formats_xml URI from the debates tibble
+second_stage_uri <- bill_debates |>
+  filter(grepl("Health.*Miscellaneous", section_title, ignore.case = TRUE)) |>
+  pull(formats_xml) |>
+  head(1)
+
+if (length(second_stage_uri) == 1 && !is.na(second_stage_uri)) {
+  transcript <- get_debate_text(second_stage_uri)
+
+  # Word count by speaker
+  transcript |>
+    mutate(word_count = lengths(strsplit(text, "\\s+"))) |>
+    group_by(speaker_name) |>
+    summarise(words = sum(word_count), speeches = n_distinct(speech_no)) |>
+    arrange(desc(words)) |>
+    head(10)
+}
+```
+
+---
+
+## 8  Linking Bills to Division Votes
+
+Divisions (votes) are identified by their subject line, which usually contains
+the bill short title and stage.
+
+```{r find-divisions}
+# All Dáil divisions in the period the bill was before the house
+divs <- get_divisions(
+  chamber    = "dail",
+  date_start = "2022-10-01",
+  date_end   = "2023-06-30"
+)
+
+# Filter to divisions that mention the bill
+bill_votes <- divs |>
+  filter(grepl("Health.*Miscellaneous", subject, ignore.case = TRUE))
+
+bill_votes |>
+  select(date, division_no, subject, count_ta, count_nil, count_staon)
+#> # A tibble: 4 × 6
+#>   date       division_no subject                    count_ta count_nil count_staon
+#>   <chr>            <chr> <chr>                         <chr>     <chr>       <chr>
+#> 1 2023-04-18          43 Health (Misc Provs) Bill …       77        56           0
+#> 2 2023-04-18          44 Health (Misc Provs) Bill …       79        55           0
+#> ...
+```
+
+### 8.1  Vote breakdown for the final stage
+
+```{r vote-breakdown}
+# Take the last division (typically the 5th Stage / final vote)
+final_div_id <- bill_votes |>
+  slice_max(as.integer(division_no), n = 1) |>
+  pull(division_id)
+
+votes <- get_division_votes(final_div_id)
+
+votes |>
+  count(vote, name = "n_members") |>
+  mutate(vote = recode(vote, ta = "Tá (Yes)", nil = "Níl (No)",
+                       staon = "Staon (Abstain)"))
+#> # A tibble: 2 × 2
+#>   vote          n_members
+#>   <chr>             <int>
+#> 1 Tá (Yes)             77
+#> 2 Níl (No)             56
+```
+
+```{r plot-vote, fig.width=5, fig.height=3.5}
+votes |>
+  count(vote) |>
+  mutate(
+    vote  = recode(vote, ta = "Tá (Yes)", nil = "Níl (No)",
+                   staon = "Staon (Abstain)"),
+    vote  = factor(vote, levels = c("Tá (Yes)", "Níl (No)", "Staon (Abstain)"))
+  ) |>
+  ggplot(aes(x = vote, y = n, fill = vote)) +
+  geom_col(width = 0.5, show.legend = FALSE) +
+  geom_text(aes(label = n), vjust = -0.4, size = 4.5, fontface = "bold") +
+  scale_fill_manual(values = c(
+    "Tá (Yes)"       = "#2a9d8f",
+    "Níl (No)"       = "#e76f51",
+    "Staon (Abstain)"= "#bdbdbd"
+  )) +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    title    = "Health (Misc. Provisions) Bill 2022 — Final Division",
+    subtitle = paste0("Division no. ", bill_votes$division_no[nrow(bill_votes)],
+                      " · ", bill_votes$date[nrow(bill_votes)]),
+    x        = NULL,
+    y        = "Members"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.x = element_blank())
+```
+
+---
+
+## 9  Enacted Bills by Year
+
+A simple time-series showing legislative output across years.
+
+```{r enacted-all}
+# Fetch all enacted bills (this is cached after the first call)
+enacted_all <- get_legislation(bill_status = "Enacted", all_pages = TRUE)
+
+enacted_by_year <- enacted_all |>
+  filter(!is.na(act_year)) |>
+  count(act_year, bill_type, name = "n_acts") |>
+  mutate(act_year = as.integer(act_year)) |>
+  filter(act_year >= 2010)
+```
+
+```{r plot-enacted-year, fig.width=8, fig.height=4.5}
+ggplot(enacted_by_year,
+       aes(x = act_year, y = n_acts, fill = bill_type)) +
+  geom_col(position = "stack") +
+  scale_fill_manual(
+    values = c("Government" = "#457b9d", "Private Members'" = "#e9c46a"),
+    name   = "Bill type"
+  ) +
+  scale_x_continuous(breaks = 2010:2025) +
+  labs(
+    title = "Acts of the Oireachtas by Year (2010–2024)",
+    x     = NULL,
+    y     = "Acts enacted"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+---
+
+## 10  A Complete Bill Audit: From Introduction to Transcript
+
+Combining the four main functions into one analytical pipeline:
+
+```{r full-audit}
+## Step 1 – identify a bill
+target <- get_legislation(bill_no = 105, bill_year = 2021) # e.g. Electoral Reform Bill
+
+cat("Title:", target$title, "\n")
+cat("Status:", target$bill_status, "\n")
+cat("Introduced:", target$date_introduced, "\n")
+cat("Enacted as:", paste0("No. ", target$act_no, " of ", target$act_year), "\n")
+
+## Step 2 – find related debates
+related <- get_debates(
+  chamber    = "dail",
+  date_start = target$date_introduced,
+  date_end   = paste0(target$act_year, "-12-31")
+)
+
+bill_kw <- gsub("\\(.*\\)", "", target$title) |> trimws()   # strip parenthetical
+bill_debates <- related |>
+  filter(grepl(bill_kw, section_title, ignore.case = TRUE))
+
+cat("Debate sections found:", nrow(bill_debates), "\n")
+
+## Step 3 – fetch full transcript of the Second Stage debate
+if (nrow(bill_debates) > 0) {
+  transcript <- get_debate_text(bill_debates$formats_xml[1])
+
+  word_share <- transcript |>
+    mutate(words = lengths(strsplit(text, "\\s+"))) |>
+    group_by(speaker_name) |>
+    summarise(words = sum(words)) |>
+    mutate(pct = round(words / sum(words) * 100, 1)) |>
+    arrange(desc(words))
+
+  print(word_share)
+}
+
+## Step 4 – find the final division vote
+bill_divs <- get_divisions(
+  chamber    = "dail",
+  date_start = target$date_introduced,
+  date_end   = paste0(target$act_year, "-12-31")
+) |>
+  filter(grepl(bill_kw, subject, ignore.case = TRUE))
+
+if (nrow(bill_divs) > 0) {
+  final_vote <- get_division_votes(tail(bill_divs$division_id, 1))
+  cat("\nFinal division result:\n")
+  print(count(final_vote, vote))
+}
+```
+
+---
+
+## Further Reading
+
+- [Oireachtas Open Data API](https://api.oireachtas.ie/) — full endpoint
+  reference and field descriptions.
+- [Akoma Ntoso](http://www.akomantoso.org/) — the XML standard used for all
+  debate transcripts, parseable with `get_debate_text()`.
+- Other vignettes in this package:
+  - *Sentiment analysis of debate transcripts*
+  - *Topic modelling of parliamentary questions*
+  - *Voting cohesion clustering*
+  - *Member responsiveness around news events*
