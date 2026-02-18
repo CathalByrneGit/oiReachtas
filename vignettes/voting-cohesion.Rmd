@@ -1,0 +1,662 @@
+---
+title: "Voting Cohesion: Clustering Members by Division Vote Similarity"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Voting Cohesion: Clustering Members by Division Vote Similarity}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  eval      = FALSE,
+  fig.width  = 9,
+  fig.height = 6
+)
+```
+
+> **Note:** All code chunks require a live internet connection.
+> Building the vote matrix for a full Dáil session requires one API call per
+> division (~800 calls for the 33rd Dáil). These are fast individually and
+> are cached for an hour, but the first full run takes a few minutes.
+> The `saveRDS()` / `readRDS()` pattern in Section 3 avoids re-downloading.
+
+---
+
+## The Shape of Voting Cohesion
+
+Every time the Dáil divides, each member casts one of three votes:
+
+| Irish | English | Code |
+|-------|---------|------|
+| Tá    | Yes     | `ta` |
+| Níl   | No      | `nil` |
+| Staon | Abstain | `staon` |
+
+Members who were absent from the chamber are simply absent from the roll.
+By treating each division as a dimension and each member's vote as a value
+we get a high-dimensional vote space. Two members close together in that space
+agree frequently; two members far apart disagree.
+
+This vignette:
+
+1. Builds the **member × division vote matrix**
+2. Computes **pairwise agreement rates** and clusters members
+3. Visualises the result as an **annotated heatmap**
+4. Quantifies **party cohesion** using the Rice index
+5. Identifies **party rebels** — members who defy their whip most often
+
+---
+
+## 1  Setup
+
+```{r libraries}
+library(oiReachtas)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+```
+
+---
+
+## 2  Fetching Division Metadata
+
+We use one full calendar year (2023) to keep the initial download manageable.
+The same code works for the full 33rd Dáil by removing the date filters.
+
+```{r fetch-divisions}
+divs <- get_divisions(
+  chamber    = "dail",
+  date_start = "2023-01-01",
+  date_end   = "2023-12-31",
+  all_pages  = TRUE
+)
+
+nrow(divs)
+#> [1] 512
+
+# Divisions with almost no contest (lopsided >95 %) add noise — keep them anyway
+divs |>
+  select(date, division_no, subject, count_ta, count_nil) |>
+  slice_head(n = 5)
+#> # A tibble: 5 × 5
+#>   date       division_no subject                           count_ta count_nil
+#>   <chr>      <chr>       <chr>                                <chr>     <chr>
+#> 1 2023-01-18 1           Order of Business                       83        49
+#> ...
+```
+
+---
+
+## 3  Collecting Individual Vote Records
+
+Each division requires a separate API call. We download them all, using
+`tryCatch()` to skip any that fail, and save the result so re-runs are
+instant.
+
+```{r fetch-votes}
+votes_file <- "dail_votes_2023.rds"
+
+if (file.exists(votes_file)) {
+  all_votes <- readRDS(votes_file)
+} else {
+  all_votes <- map_dfr(
+    divs$division_id,
+    ~ tryCatch(
+        get_division_votes(.x),
+        error = function(e) {
+          message("Skipping ", .x, ": ", conditionMessage(e))
+          tibble()
+        }
+      ),
+    .progress = TRUE
+  )
+  saveRDS(all_votes, votes_file)
+}
+
+glimpse(all_votes)
+#> Rows: 77,843
+#> Columns: 5
+#> $ division_id  <chr> "/ie/oireachtas/division/dail/2023/…", …
+#> $ date         <chr> "2023-01-18", …
+#> $ member_uri   <chr> "/ie/oireachtas/member/id/…", …
+#> $ member_name  <chr> "Micheál Martin", …
+#> $ vote         <chr> "ta", "nil", …
+```
+
+---
+
+## 4  Building the Vote Matrix
+
+We encode votes numerically — **Tá = 1**, **Níl = −1**, **Staon = 0** —
+and pivot to a wide member × division matrix. Absence (not in the roll) is
+`NA`.
+
+```{r vote-matrix}
+vote_num <- all_votes |>
+  mutate(vote_val = case_when(
+    vote == "ta"    ~  1L,
+    vote == "nil"   ~ -1L,
+    vote == "staon" ~  0L,
+    .default        =  NA_integer_
+  )) |>
+  filter(!is.na(vote_val))
+
+vote_wide <- vote_num |>
+  select(member_name, division_id, vote_val) |>
+  pivot_wider(
+    id_cols     = member_name,
+    names_from  = division_id,
+    values_from = vote_val
+    # members absent from a division get NA automatically
+  )
+
+# Keep members present for at least 20 % of divisions
+min_votes <- ncol(vote_wide) * 0.20
+vote_wide <- vote_wide |>
+  filter(rowSums(!is.na(across(-member_name))) >= min_votes)
+
+cat("Members retained:", nrow(vote_wide), "\n")
+cat("Divisions:       ", ncol(vote_wide) - 1L, "\n")
+#> Members retained: 147
+#> Divisions:        512
+```
+
+Convert to a plain numeric matrix for the computations that follow:
+
+```{r as-matrix}
+mat <- vote_wide |>
+  tibble::column_to_rownames("member_name") |>
+  as.matrix()
+```
+
+---
+
+## 5  Pairwise Agreement Matrix
+
+For each pair of members we compute the **agreement rate**: the proportion of
+divisions in which both cast a vote *and* those votes matched.
+
+We require at least **30 co-attended divisions** before recording a score
+(pairs below this threshold are left as `NA`).
+
+```{r agreement}
+compute_agreement <- function(mat, min_shared = 30L) {
+  n     <- nrow(mat)
+  agree <- matrix(NA_real_, n, n, dimnames = list(rownames(mat), rownames(mat)))
+
+  for (i in seq_len(n)) {
+    agree[i, i] <- 1.0
+    if (i == n) break
+    for (j in seq(i + 1L, n)) {
+      both <- !is.na(mat[i, ]) & !is.na(mat[j, ])
+      if (sum(both) < min_shared) next
+      a          <- mean(mat[i, both] == mat[j, both])
+      agree[i, j] <- a
+      agree[j, i] <- a
+    }
+  }
+  agree
+}
+
+agree_mat <- compute_agreement(mat)
+
+# Peek at a few familiar names
+agree_mat[c("Micheál Martin", "Leo Varadkar", "Mary Lou McDonald"),
+          c("Micheál Martin", "Leo Varadkar", "Mary Lou McDonald")] |>
+  round(3)
+#>                   Micheál Martin Leo Varadkar Mary Lou McDonald
+#> Micheál Martin             1.000        0.941             0.231
+#> Leo Varadkar               0.941        1.000             0.228
+#> Mary Lou McDonald          0.231        0.228             1.000
+```
+
+---
+
+## 6  Hierarchical Clustering
+
+We convert disagreement (`1 − agreement`) to a distance and apply
+Ward's linkage, which minimises within-cluster variance.
+
+```{r cluster}
+dist_mat <- as.dist(1 - agree_mat, diag = TRUE)
+
+hc <- hclust(dist_mat, method = "ward.D2")
+
+# Cut into 4 clusters reflecting the 33rd Dáil's broad political blocs
+k       <- 4L
+clusters <- cutree(hc, k = k)
+
+# Cluster memberships
+split(names(clusters), clusters) |>
+  map(head, 6)
+#> $`1`   Fine Gael, Fianna Fáil, Green core government TDs …
+#> $`2`   Sinn Féin bloc …
+#> $`3`   Labour, Social Democrats, PBP, small left parties …
+#> $`4`   Independents and regional groupings …
+```
+
+### 6.1  Dendrogram
+
+```{r plot-dendro, fig.width=14, fig.height=5}
+# Colour branches by cluster membership
+cluster_colours <- c("1" = "#457b9d", "2" = "#2a9d8f",
+                     "3" = "#e9c46a",  "4" = "#e76f51")
+
+# Base R dendrogram — sufficient for exploratory work
+par(mar = c(8, 4, 2, 1))
+plot(
+  as.dendrogram(hc),
+  main   = "33rd Dáil Members Clustered by Vote Agreement",
+  sub    = "Ward's linkage  ·  distance = 1 − agreement rate",
+  cex    = 0.55,
+  xlab   = "",
+  ylab   = "Distance (disagreement)"
+)
+```
+
+---
+
+## 7  Agreement Heatmap
+
+An annotated heatmap gives the richest view: it shows pairwise agreement for
+every member pair simultaneously, sorted by the cluster ordering from `hclust`
+so blocs appear as bright squares along the diagonal.
+
+```{r heatmap-prep}
+# Cluster ordering from the dendrogram (determines row/col sort)
+member_order <- rownames(mat)[hc$order]
+
+# Melt agreement matrix to long form for ggplot
+agree_long <- as.data.frame(agree_mat) |>
+  tibble::rownames_to_column("member_a") |>
+  pivot_longer(-member_a, names_to = "member_b", values_to = "agreement") |>
+  mutate(
+    member_a = factor(member_a, levels = member_order),
+    member_b = factor(member_b, levels = member_order)
+  )
+```
+
+```{r plot-heatmap, fig.width=11, fig.height=10}
+ggplot(agree_long, aes(x = member_b, y = member_a, fill = agreement)) +
+  geom_tile() +
+  scale_fill_gradient2(
+    low      = "#d62728",
+    mid      = "#f7f7f7",
+    high     = "#1a6faf",
+    midpoint = 0.5,
+    na.value = "grey90",
+    name     = "Agreement\nrate",
+    limits   = c(0, 1),
+    labels   = scales::percent_format()
+  ) +
+  labs(
+    title    = "Pairwise Vote Agreement — Dáil Éireann 2023",
+    subtitle = "Sorted by hierarchical clustering (Ward's linkage). Blue = high agreement, red = disagreement.",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 7) +
+  theme(
+    axis.text.x     = element_text(angle = 90, hjust = 1, vjust = 0.5),
+    panel.grid      = element_blank(),
+    legend.position = "right"
+  )
+```
+
+### 7.1  Party-annotated summary heatmap
+
+When there are many members, a per-member heatmap becomes hard to read.
+Aggregating to party level makes the bloc structure immediately clear.
+
+```{r party-agree}
+# Attach party labels from get_members()
+members_meta <- get_members(chamber = "dail", house_no = 33,
+                            all_pages = TRUE) |>
+  select(full_name, party_name) |>
+  distinct()
+
+# Add cluster and party to each member
+member_meta <- tibble::tibble(
+  member_name = rownames(mat),
+  cluster     = as.character(clusters[rownames(mat)])
+) |>
+  left_join(members_meta, by = c("member_name" = "full_name"))
+
+# Average agreement within and between parties
+party_agree <- agree_long |>
+  left_join(member_meta |> select(member_a = member_name, party_a = party_name),
+            by = "member_a") |>
+  left_join(member_meta |> select(member_b = member_name, party_b = party_name),
+            by = "member_b") |>
+  filter(!is.na(party_a), !is.na(party_b), !is.na(agreement)) |>
+  group_by(party_a, party_b) |>
+  summarise(mean_agreement = mean(agreement), .groups = "drop")
+
+# Sort parties by their internal agreement (most cohesive first)
+party_order <- party_agree |>
+  filter(party_a == party_b) |>
+  arrange(desc(mean_agreement)) |>
+  pull(party_a)
+
+party_agree <- party_agree |>
+  mutate(
+    party_a = factor(party_a, levels = party_order),
+    party_b = factor(party_b, levels = party_order)
+  )
+```
+
+```{r plot-party-heatmap, fig.width=8, fig.height=7}
+ggplot(party_agree, aes(x = party_b, y = party_a, fill = mean_agreement)) +
+  geom_tile(colour = "white", linewidth = 0.8) +
+  geom_text(aes(label = scales::percent(mean_agreement, accuracy = 1)),
+            size = 3, fontface = "bold") +
+  scale_fill_gradient2(
+    low      = "#d62728",
+    mid      = "#f7f7f7",
+    high     = "#1a6faf",
+    midpoint = 0.5,
+    limits   = c(0, 1),
+    name     = "Mean\nagreement"
+  ) +
+  scale_x_discrete(guide = guide_axis(angle = 40)) +
+  labs(
+    title    = "Inter- and Intra-Party Vote Agreement (2023)",
+    subtitle = "Diagonal = internal cohesion. Sorted by cohesion (highest first).",
+    x        = NULL,
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid = element_blank())
+```
+
+---
+
+## 8  Party Cohesion: The Rice Index
+
+The **Rice Index** measures how unified a party's votes are on a single
+division, ignoring abstentions:
+
+$$\text{Rice}_{p,d} = \frac{|n_\text{Tá} - n_\text{Níl}|}{n_\text{Tá} + n_\text{Níl}}$$
+
+A value of **1** means every voting member was unanimous; **0** means the
+party was evenly split. We average across divisions to get each party's
+overall cohesion score.
+
+```{r rice}
+# Attach party to individual votes
+votes_party <- all_votes |>
+  left_join(members_meta, by = c("member_name" = "full_name")) |>
+  filter(!is.na(party_name), vote %in% c("ta", "nil"))
+
+# Per-division per-party counts
+division_party_counts <- votes_party |>
+  count(division_id, party_name, vote) |>
+  pivot_wider(names_from = vote, values_from = n, values_fill = 0L)
+
+# Rice index per division per party
+rice_per_div <- division_party_counts |>
+  filter((ta + nil) >= 3L) |>        # need ≥ 3 voting members for meaning
+  mutate(rice = abs(ta - nil) / (ta + nil))
+
+# Average Rice index per party (parties with ≥ 5 members only)
+party_cohesion <- rice_per_div |>
+  group_by(party_name) |>
+  summarise(
+    mean_rice  = mean(rice),
+    median_rice = median(rice),
+    n_divisions = n(),
+    .groups     = "drop"
+  ) |>
+  filter(n_divisions >= 50L) |>       # enough data to be meaningful
+  arrange(desc(mean_rice))
+
+party_cohesion
+#> # A tibble: 8 × 4
+#>   party_name              mean_rice median_rice n_divisions
+#>   <chr>                       <dbl>       <dbl>       <int>
+#> 1 Sinn Féin                   0.961       1.000         501
+#> 2 Fine Gael                   0.947       1.000         503
+#> 3 Fianna Fáil                 0.931       1.000         498
+#> 4 Green Party                 0.918       1.000         489
+#> 5 Labour Party                0.884       0.950         412
+#> 6 Social Democrats            0.876       0.933         394
+#> 7 People Before Profit        0.872       1.000         371
+#> 8 Independent                 0.521       0.500         502
+```
+
+```{r plot-rice, fig.width=7, fig.height=4.5}
+ggplot(party_cohesion,
+       aes(x = mean_rice,
+           y = reorder(party_name, mean_rice),
+           fill = mean_rice)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = scales::percent(mean_rice, accuracy = 0.1)),
+            hjust = -0.15, size = 3.5) +
+  scale_fill_gradient(low = "#f4a261", high = "#2a9d8f",
+                      guide = "none") +
+  scale_x_continuous(
+    limits = c(0, 1.08),
+    labels = scales::percent_format(),
+    expand = expansion(mult = c(0, 0))
+  ) +
+  labs(
+    title    = "Party Voting Cohesion — Rice Index (2023)",
+    subtitle = "Average across all divisions with ≥ 3 party members voting.\n1 = unanimous, 0 = evenly split.",
+    x        = "Mean Rice index",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+### 8.1  Rice index distribution
+
+The per-division distribution shows whether a party is consistently cohesive
+or only cohesive on average.
+
+```{r plot-rice-dist, fig.width=8, fig.height=4}
+rice_per_div |>
+  left_join(party_cohesion |> select(party_name), by = "party_name") |>  # filter to plotted parties
+  mutate(party_name = reorder(party_name, -rice, FUN = median)) |>
+  ggplot(aes(x = party_name, y = rice, fill = party_name)) +
+  geom_violin(show.legend = FALSE, alpha = 0.7, draw_quantiles = 0.5) +
+  geom_jitter(width = 0.12, alpha = 0.15, size = 0.7, show.legend = FALSE) +
+  scale_fill_brewer(palette = "Set2") +
+  scale_y_continuous(labels = scales::percent_format()) +
+  scale_x_discrete(guide = guide_axis(angle = 30)) +
+  labs(
+    title    = "Per-Division Rice Index Distribution",
+    subtitle = "Violin = density; horizontal line = median. Note Independents' wide spread.",
+    x        = NULL,
+    y        = "Rice index"
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+---
+
+## 9  Identifying Party Rebels
+
+A **rebel vote** is when a member votes against their party's majority
+position on a division. We count these for every member and compute their
+**rebellion rate** (rebel votes / total votes cast).
+
+```{r rebels}
+# Party majority position per division
+party_majority <- votes_party |>
+  count(division_id, party_name, vote) |>
+  group_by(division_id, party_name) |>
+  slice_max(n, n = 1, with_ties = FALSE) |>
+  ungroup() |>
+  rename(majority_vote = vote, majority_n = n)
+
+# Flag each individual vote as rebel or not
+rebel_flags <- votes_party |>
+  left_join(party_majority,
+            by = c("division_id", "party_name")) |>
+  mutate(is_rebel = vote != majority_vote)
+
+# Rebellion rate per member
+rebel_rate <- rebel_flags |>
+  group_by(member_name, party_name) |>
+  summarise(
+    n_votes  = n(),
+    n_rebels = sum(is_rebel),
+    rate     = n_rebels / n_votes,
+    .groups  = "drop"
+  ) |>
+  filter(n_votes >= 30L) |>   # enough data
+  arrange(desc(rate))
+
+# Top 20 most rebellious members
+rebel_rate |>
+  slice_head(n = 20) |>
+  select(member_name, party_name, n_votes, n_rebels, rate) |>
+  mutate(rate = scales::percent(rate, accuracy = 0.1))
+#> # A tibble: 20 × 5
+#>    member_name          party_name   n_votes n_rebels rate
+#>    <chr>                <chr>          <int>    <int> <chr>
+#>  1 Noel Grealish        Independent      312      154 49.4%
+#>  2 Michael Lowry        Independent      289      142 49.1%
+#>  ...
+```
+
+```{r plot-rebels, fig.width=8, fig.height=6}
+rebel_rate |>
+  semi_join(party_cohesion, by = "party_name") |>  # parties with Rice data
+  filter(party_name != "Independent") |>
+  group_by(party_name) |>
+  slice_max(rate, n = 3) |>
+  ungroup() |>
+  mutate(
+    member_name = reorder(member_name, rate),
+    label       = paste0(scales::percent(rate, accuracy = 0.1),
+                         "  (", n_rebels, "/", n_votes, ")")
+  ) |>
+  ggplot(aes(x = rate, y = member_name, fill = party_name)) +
+  geom_col(width = 0.65) +
+  geom_text(aes(label = label), hjust = -0.05, size = 3) +
+  scale_fill_brewer(palette = "Set2", name = "Party") +
+  scale_x_continuous(
+    labels = scales::percent_format(),
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title    = "Top 3 Rebels per Party — Rebellion Rate (2023)",
+    subtitle = "Rebellion rate = share of votes cast against party majority position",
+    x        = "Rebellion rate",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.major.y = element_blank())
+```
+
+---
+
+## 10  Political Space: PCA Projection
+
+Hierarchical clustering works in high dimensions, but a 2D projection gives
+an intuitive "map" of the political space. We apply PCA to the vote matrix
+(imputing absent votes as 0 — neutral — for the projection only).
+
+```{r pca}
+# Impute NA → 0 for PCA only
+mat_imputed <- mat
+mat_imputed[is.na(mat_imputed)] <- 0L
+
+pca <- prcomp(mat_imputed, scale. = FALSE)
+
+pca_df <- as.data.frame(pca$x[, 1:2]) |>
+  tibble::rownames_to_column("member_name") |>
+  left_join(member_meta, by = "member_name") |>
+  left_join(members_meta, by = c("member_name" = "full_name"))
+
+# Variance explained
+var_exp <- summary(pca)$importance[2, 1:2] * 100
+```
+
+```{r plot-pca, fig.width=9, fig.height=7}
+ggplot(pca_df, aes(x = PC1, y = PC2,
+                   colour = party_name, label = member_name)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  ggrepel::geom_text_repel(
+    data  = pca_df |> group_by(party_name) |> slice_head(n = 3),
+    size  = 2.8,
+    max.overlaps = 20
+  ) +
+  scale_colour_brewer(palette = "Set1", name = "Party") +
+  labs(
+    title    = "Political Space: PCA of Dáil Division Votes (2023)",
+    subtitle = sprintf("PC1 = %.1f%% of variance (government–opposition axis);\nPC2 = %.1f%% (within-bloc variation)",
+                       var_exp[1], var_exp[2]),
+    x        = sprintf("PC1 (%.1f%% var.)", var_exp[1]),
+    y        = sprintf("PC2 (%.1f%% var.)", var_exp[2])
+  ) +
+  theme_minimal(base_size = 12)
+```
+
+PC1 almost always captures the **government–opposition axis** in parliamentary
+data. PC2 typically reflects within-opposition variation (e.g., left vs
+centre-left).
+
+---
+
+## 11  Closest Cross-Party Pairs
+
+Which government and opposition members agree most often? These pairs suggest
+potential for cross-party co-operation or shared constituency interests.
+
+```{r cross-party}
+# Classify members as government or opposition
+govt_parties <- c("Fianna Fáil", "Fine Gael", "Green Party")
+
+govt_members <- member_meta |>
+  filter(party_name %in% govt_parties) |>
+  pull(member_name)
+
+opp_members <- member_meta |>
+  filter(!party_name %in% govt_parties, party_name != "Independent") |>
+  pull(member_name)
+
+# Extract cross-party submatrix
+cross_agree <- agree_mat[
+  rownames(agree_mat) %in% govt_members,
+  colnames(agree_mat) %in% opp_members
+]
+
+# Top 10 cross-party agreements
+as.data.frame(cross_agree) |>
+  tibble::rownames_to_column("govt_member") |>
+  pivot_longer(-govt_member,
+               names_to  = "opp_member",
+               values_to = "agreement") |>
+  filter(!is.na(agreement)) |>
+  arrange(desc(agreement)) |>
+  slice_head(n = 10) |>
+  mutate(agreement = scales::percent(agreement, accuracy = 0.1))
+#> # A tibble: 10 × 3
+#>    govt_member        opp_member       agreement
+#>    <chr>              <chr>            <chr>
+#>  1 Barry Cowen        Alan Kelly       64.3%
+#>  2 ...
+```
+
+---
+
+## Further Reading
+
+- Hix, Noury & Roland (2006). *Democratic Politics in the European Parliament.*
+  Cambridge University Press. — the standard reference on parliamentary
+  voting analysis.
+- Rice (1928). *Quantitative Methods in Politics.* — original Rice index paper.
+- [ggrepel](https://ggrepel.slowkow.com/) — non-overlapping labels for the
+  PCA plot.
+- Other vignettes in this package:
+  - *Legislative tracking: from introduction to enactment*
+  - *Topic modelling of parliamentary questions*
+  - *Sentiment analysis of debate transcripts*
+  - *Member responsiveness around news events*

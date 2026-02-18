@@ -32,7 +32,10 @@ Suggests:
     httptest,
     ggplot2 (>= 3.4.0),
     tidytext (>= 0.4.0),
-    topicmodels (>= 0.2.0)
+    topicmodels (>= 0.2.0),
+    tidyr (>= 1.0.0),
+    scales (>= 1.2.0),
+    ggrepel (>= 0.9.0)
 VignetteBuilder: knitr
 Config/testthat/edition: 3
 URL: https://github.com/CathalByrneGit/oiReachtas
