@@ -1,0 +1,708 @@
+---
+title: "Focus vs. Reactivity: Identifying Specialists and Populists in the Dáil"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Focus vs. Reactivity: Identifying Specialists and Populists in the Dáil}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  eval      = FALSE,
+  fig.width  = 9,
+  fig.height = 6
+)
+```
+
+> **Note:** All code chunks require a live internet connection.
+> The vignette reuses the domain lookup and TF-IDF pipeline introduced in
+> *Member Profiling* — run that vignette first, or re-run sections 2–4 here
+> to rebuild the required objects.
+
+---
+
+## The Specialist vs. Populist Question
+
+Two TDs can both ask about housing without resembling each other at all.
+One has asked about housing for four consecutive years regardless of what's
+in the headlines — she built a reputation as the go-to voice on planning
+reform long before it became a crisis.
+The other pivoted to housing questions the week a record rental index was
+published, having spent the previous quarter asking about broadband, tourism,
+and data centres.
+
+These are fundamentally different parliamentary behaviours.
+Distinguishing them requires measuring **two orthogonal dimensions**:
+
+| Dimension | High score means | Low score means |
+|-----------|-----------------|-----------------|
+| **Focus** | Questions concentrated in few policy areas | Questions spread across many areas |
+| **Consistency** | Same topics quarter after quarter | Topics shift with news cycles |
+
+Crossing these two dimensions produces four archetypes:
+
+```
+                HIGH CONSISTENCY
+                       │
+    Deep specialist    │    Steady generalist
+    "Owns the brief"   │    "Reliable workhorse"
+                       │
+LOW FOCUS ─────────────┼───────────────── HIGH FOCUS
+                       │
+    Populist           │    Bandwagon rider
+    "Chases headlines" │    "Latest hot take"
+                       │
+                LOW CONSISTENCY
+```
+
+A third dimension — **herd instinct** — measures whether a member's monthly
+topic distribution tracks or diverges from the Dáil-wide topic surge.
+High herd instinct is a hallmark of the populist quadrant even when that
+member's raw focus score looks deceptively high.
+
+---
+
+## 1  Setup
+
+```{r libraries}
+library(oiReachtas)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(tidytext)
+```
+
+---
+
+## 2  Data
+
+```{r fetch}
+# ── Member roster ─────────────────────────────────────────────────────────
+members <- get_members(house = "dail", limit = 200) |>
+  select(member_id = member_pId, member_name, party, constituency)
+
+# ── Two years of written questions (more time = better consistency signal) ─
+qs_raw <- get_questions(
+  date_start    = "2023-01-01",
+  date_end      = "2024-12-31",
+  question_type = "written",
+  limit         = 9000
+)
+
+qs <- qs_raw |>
+  select(member_pId, show_as, dept_name, date) |>
+  left_join(members, by = c("member_pId" = "member_id")) |>
+  filter(!is.na(member_name), !is.na(show_as), nchar(show_as) > 5) |>
+  mutate(
+    date    = as.Date(date),
+    year    = format(date, "%Y"),
+    month   = format(date, "%Y-%m"),
+    quarter = paste0(format(date, "%Y"), "-Q",
+                     ceiling(as.integer(format(date, "%m")) / 3))
+  )
+
+# Minimum questions threshold — members with very few questions give noisy signals
+MIN_QS <- 20
+active_members <- qs |> count(member_name) |> filter(n >= MIN_QS) |> pull(member_name)
+qs <- filter(qs, member_name %in% active_members)
+
+cat(nrow(qs), "questions from", length(active_members), "members\n")
+```
+
+---
+
+## 3  Domain Scoring
+
+We reuse the ten-domain keyword lookup from the *Member Profiling* vignette.
+
+```{r domains}
+oireachtas_stops <- tibble(word = c(
+  "minister", "government", "plans", "measures", "steps", "action", "actions",
+  "information", "details", "aware", "issues", "concerned", "basis", "provision",
+  "provisions", "matter", "matters", "support", "supports", "service", "services",
+  "scheme", "schemes", "regard", "relevant", "area", "areas", "funding", "ensure",
+  "provide", "policy", "policies", "report", "request", "asked", "stated",
+  "confirm", "outlined"
+))
+
+domains <- list(
+  "Housing"       = c("housing", "rent", "home", "tenant", "landlord",
+                      "accommodation", "planning", "homeless", "eviction",
+                      "hap", "hal", "rents", "residential", "development"),
+  "Health"        = c("health", "hospital", "hse", "waiting", "gp", "mental",
+                      "nursing", "cancer", "ambulance", "pharmacy", "disability",
+                      "maternity", "beds", "staffing"),
+  "Education"     = c("school", "teacher", "education", "college", "university",
+                      "student", "special", "sen", "curriculum", "sna", "pupil"),
+  "Transport"     = c("road", "bus", "train", "rail", "cycle", "traffic",
+                      "transport", "motorway", "greenway", "luas", "dart"),
+  "Environment"   = c("climate", "carbon", "emission", "renewable", "energy",
+                      "wind", "solar", "waste", "water", "flood", "biodiversity"),
+  "Social Welfare"= c("welfare", "pension", "disability", "carer", "benefit",
+                      "payment", "allowance", "dsp", "jobseeker", "poverty"),
+  "Justice"       = c("garda", "crime", "court", "prison", "legal", "justice",
+                      "solicitor", "offence", "victim", "drugs", "violence"),
+  "Agriculture"   = c("farmer", "farm", "agri", "dairy", "beef", "rural",
+                      "fishing", "forestry", "land", "tillage", "dafm"),
+  "Enterprise"    = c("enterprise", "business", "sme", "employment", "job",
+                      "tax", "vat", "trade", "investment", "startup", "export"),
+  "Foreign"       = c("foreign", "ukraine", "conflict", "israel", "palestine",
+                      "defence", "international", "migration", "asylum", "refugee")
+)
+
+domain_lookup <- imap_dfr(domains, ~ tibble(word = .x, domain = .y))
+K_DOMAINS <- length(domains)  # 10
+
+# Tidy question corpus with domain tags
+tidy_qs <- qs |>
+  unnest_tokens(word, show_as) |>
+  anti_join(stop_words,       by = "word") |>
+  anti_join(oireachtas_stops, by = "word") |>
+  filter(nchar(word) > 2, !grepl("^[0-9]+$", word))
+
+domain_words <- tidy_qs |>
+  inner_join(domain_lookup, by = "word")
+```
+
+---
+
+## 4  Focus Score — Herfindahl-Hirschman Index
+
+The **HHI** (borrowed from market-concentration economics) measures how
+unevenly a member's questions are distributed across domains.
+
+* HHI = Σ (share_i)²
+* Ranges from **1/k ≈ 0.1** (perfectly uniform) to **1.0** (single domain)
+* We normalise to 0–1: `(HHI − 1/k) / (1 − 1/k)`
+
+A score of 1 means every question is in the same domain.
+A score of 0 means questions are uniformly spread across all ten.
+
+```{r hhi}
+member_domain_shares <- domain_words |>
+  count(member_name, domain, name = "n") |>
+  group_by(member_name) |>
+  # Fill domains with 0 questions
+  complete(domain = names(domains), fill = list(n = 0)) |>
+  mutate(share = n / sum(n)) |>
+  ungroup()
+
+focus_scores <- member_domain_shares |>
+  group_by(member_name) |>
+  summarise(
+    hhi       = sum(share^2),
+    hhi_norm  = (hhi - 1/K_DOMAINS) / (1 - 1/K_DOMAINS),
+    top_domain = domain[which.max(share)],
+    top_share  = max(share),
+    .groups    = "drop"
+  )
+
+# Distribution
+ggplot(focus_scores, aes(hhi_norm)) +
+  geom_histogram(bins = 30, fill = "#5C6BC0", colour = "white") +
+  geom_vline(xintercept = median(focus_scores$hhi_norm),
+             linetype = "dashed", colour = "grey40") +
+  annotate("text", x = median(focus_scores$hhi_norm) + 0.01,
+           y = Inf, vjust = 1.5, hjust = 0,
+           label = "median", size = 3, colour = "grey30") +
+  labs(
+    title    = "Distribution of member focus scores (normalised HHI)",
+    subtitle = "0 = questions spread uniformly · 1 = all questions in one domain",
+    x        = "Focus score (normalised HHI)", y = "Members"
+  ) +
+  theme_minimal()
+```
+
+```{r focus-bar}
+focus_scores |>
+  left_join(select(members, member_name, party), by = "member_name") |>
+  slice_max(hhi_norm, n = 30) |>
+  mutate(member_name = reorder(member_name, hhi_norm)) |>
+  ggplot(aes(hhi_norm, member_name, fill = party)) +
+  geom_col() +
+  geom_text(aes(label = top_domain), hjust = -0.05, size = 2.8, colour = "grey30") +
+  scale_fill_manual(
+    values = c("FF" = "#66BB6A", "FG" = "#42A5F5", "SF" = "#4CAF50",
+               "Lab" = "#EF5350", "GP" = "#26A69A", "SD" = "#AB47BC",
+               "PBP" = "#FF7043", "Ind" = "#78909C"),
+    na.value = "#BDBDBD"
+  ) +
+  scale_x_continuous(limits = c(0, 1.05), labels = label_percent(accuracy = 1)) +
+  labs(
+    title    = "Top-30 most focused members",
+    subtitle = "Bar shows normalised HHI; label = dominant policy domain",
+    x        = "Focus score", y = NULL, fill = "Party",
+    caption  = "Source: Oireachtas Open Data API — written questions 2023–2024"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 5  Consistency Score — Temporal Stability
+
+We split each member's question corpus into quarters and compute the
+**domain vector** (share per domain) for each quarter.  The consistency
+score is the **mean cosine similarity between consecutive quarters'
+domain vectors**.
+
+* Score near **1.0** → same topic distribution every quarter → specialist
+* Score near **0.0** → topic distribution changes radically → reactive
+
+```{r consistency}
+# Per-member per-quarter domain shares
+quarterly_domains <- domain_words |>
+  count(member_name, quarter, domain, name = "n") |>
+  group_by(member_name, quarter) |>
+  complete(domain = names(domains), fill = list(n = 0)) |>
+  mutate(share = n / (sum(n) + 1e-9)) |>
+  ungroup()
+
+# Pivot to wide so each row is a member-quarter vector
+quarterly_wide <- quarterly_domains |>
+  select(member_name, quarter, domain, share) |>
+  pivot_wider(names_from = domain, values_from = share, values_fill = 0)
+
+# Cosine similarity between two numeric vectors
+cos_sim <- function(a, b) {
+  sum(a * b) / (sqrt(sum(a^2)) * sqrt(sum(b^2)) + 1e-10)
+}
+
+# For each member, compute mean cosine similarity across consecutive quarters
+quarters_ordered <- sort(unique(quarterly_wide$quarter))
+
+consistency_scores <- quarterly_wide |>
+  group_by(member_name) |>
+  group_map(~ {
+    df <- arrange(.x, quarter)
+    if (nrow(df) < 2) return(tibble(consistency = NA_real_))
+    vecs <- df |> select(-quarter) |> as.matrix()
+    # Consecutive cosine similarities
+    sims <- map_dbl(seq_len(nrow(vecs) - 1),
+                    ~ cos_sim(vecs[.x, ], vecs[.x + 1, ]))
+    tibble(consistency = mean(sims, na.rm = TRUE))
+  }, .keep = TRUE) |>
+  bind_rows() |>
+  bind_cols(
+    quarterly_wide |>
+      group_by(member_name) |>
+      summarise(.groups = "drop") |>
+      select(member_name)
+  )
+```
+
+---
+
+## 6  Department Diversity
+
+The number of **distinct government departments** a member directs questions
+to is a coarse but intuitive measure of spread.  Specialists interrogate
+1–2 departments relentlessly; generalists (and populists) spray across many.
+
+```{r dept-diversity}
+dept_diversity <- qs |>
+  group_by(member_name) |>
+  summarise(
+    n_depts        = n_distinct(dept_name, na.rm = TRUE),
+    n_qs           = n(),
+    depts_per_100q = n_depts / n_qs * 100,
+    .groups        = "drop"
+  )
+
+ggplot(dept_diversity, aes(n_qs, n_depts)) +
+  geom_point(alpha = 0.55, colour = "#5C6BC0") +
+  geom_text_repel(
+    data = slice_max(dept_diversity, n_depts, n = 15),
+    aes(label = member_name), size = 2.5, max.overlaps = 20
+  ) +
+  scale_x_log10(labels = label_comma()) +
+  labs(
+    title    = "Questions filed vs. departments addressed",
+    subtitle = "Members top-right spread questions across many departments",
+    x        = "Total written questions (log scale)",
+    y        = "Distinct departments questioned"
+  ) +
+  theme_minimal()
+```
+
+---
+
+## 7  The Focus × Consistency Map
+
+This is the central chart — the political equivalent of a shooting-efficiency
+vs. usage-rate scatter in basketball analytics.
+
+```{r focus-consistency-map}
+# Combine all three scores
+style_scores <- focus_scores |>
+  select(member_name, focus = hhi_norm, top_domain) |>
+  inner_join(consistency_scores, by = "member_name") |>
+  inner_join(select(dept_diversity, member_name, depts_per_100q), by = "member_name") |>
+  left_join(select(members, member_name, party), by = "member_name") |>
+  filter(!is.na(consistency))
+
+# Medians — used for quadrant lines
+med_focus <- median(style_scores$focus)
+med_cons  <- median(style_scores$consistency)
+
+# Quadrant labels
+quadrant_labels <- tibble(
+  x     = c(med_focus / 2,      (1 + med_focus) / 2,
+            med_focus / 2,      (1 + med_focus) / 2),
+  y     = c(med_cons + 0.05,    med_cons + 0.05,
+            med_cons - 0.05,    med_cons - 0.05),
+  label = c("Steady generalist\n(broad, consistent)",
+            "Deep specialist\n(focused, consistent)",
+            "Populist\n(broad, reactive)",
+            "Bandwagon rider\n(focused, reactive)")
+)
+
+party_colours <- c(
+  "FF" = "#66BB6A", "FG" = "#42A5F5", "SF" = "#4CAF50",
+  "Lab" = "#EF5350", "GP" = "#26A69A", "SD" = "#AB47BC",
+  "PBP" = "#FF7043", "Ind" = "#78909C"
+)
+
+ggplot(style_scores, aes(focus, consistency, colour = party,
+                          label = member_name)) +
+  # Quadrant lines
+  geom_vline(xintercept = med_focus, linetype = "dashed",
+             colour = "grey60", linewidth = 0.5) +
+  geom_hline(yintercept = med_cons,  linetype = "dashed",
+             colour = "grey60", linewidth = 0.5) +
+  # Quadrant labels
+  geom_text(data = quadrant_labels,
+            aes(x = x, y = y, label = label),
+            colour = "grey45", size = 3, fontface = "italic",
+            lineheight = 0.85, inherit.aes = FALSE) +
+  # Members
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_text_repel(size = 2.4, max.overlaps = 18, segment.colour = "grey75") +
+  scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
+  scale_x_continuous(labels = label_percent(accuracy = 1)) +
+  scale_y_continuous(labels = label_number(accuracy = 0.01)) +
+  labs(
+    title    = "Parliamentary style: focus vs. consistency",
+    subtitle = paste0(
+      "Focus = HHI of domain shares (higher = more concentrated)  ·  ",
+      "Consistency = mean consecutive-quarter cosine similarity (higher = same topics)"),
+    x        = "Focus score (normalised HHI)",
+    y        = "Consistency score (mean consecutive-quarter cosine sim)",
+    colour   = "Party",
+    caption  = "Source: Oireachtas Open Data API — written questions 2023–2024"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "right", plot.subtitle = element_text(size = 8.5))
+```
+
+---
+
+## 8  Herd Instinct — Does the Member Track Dáil-Wide Topic Surges?
+
+For each month we compute the **Dáil-wide topic distribution** — what
+fraction of all questions across all members touched each domain.
+We then compare each member's monthly topic distribution to this
+"parliamentary zeitgeist".
+
+A high **herd instinct score** (mean cosine similarity to the Dáil-wide
+monthly vector) means the member closely mirrors what the whole chamber is
+asking about — an independent signal of reactive, news-driven behaviour.
+
+```{r herd-instinct}
+# ── Dáil-wide monthly domain fractions (the "zeitgeist") ────────────────────
+dail_monthly <- domain_words |>
+  count(month, domain, name = "n") |>
+  group_by(month) |>
+  complete(domain = names(domains), fill = list(n = 0)) |>
+  mutate(dail_share = n / (sum(n) + 1e-9)) |>
+  ungroup() |>
+  select(month, domain, dail_share)
+
+# ── Per-member monthly domain fractions ─────────────────────────────────────
+member_monthly <- domain_words |>
+  count(member_name, month, domain, name = "n") |>
+  group_by(member_name, month) |>
+  complete(domain = names(domains), fill = list(n = 0)) |>
+  mutate(member_share = n / (sum(n) + 1e-9)) |>
+  ungroup()
+
+# ── Cosine similarity of member vector vs. Dáil-wide vector, per month ──────
+herd_scores <- member_monthly |>
+  left_join(dail_monthly, by = c("month", "domain")) |>
+  group_by(member_name, month) |>
+  summarise(
+    monthly_cos = cos_sim(member_share, dail_share),
+    .groups = "drop"
+  ) |>
+  group_by(member_name) |>
+  summarise(
+    herd_instinct = mean(monthly_cos, na.rm = TRUE),
+    n_active_months = n(),
+    .groups = "drop"
+  ) |>
+  filter(n_active_months >= 4)   # need enough months for a meaningful average
+
+# Distribution
+ggplot(herd_scores, aes(herd_instinct)) +
+  geom_histogram(bins = 25, fill = "#EF5350", colour = "white") +
+  geom_vline(xintercept = median(herd_scores$herd_instinct),
+             linetype = "dashed", colour = "grey40") +
+  labs(
+    title    = "Herd instinct distribution",
+    subtitle = paste0(
+      "High score = member's monthly topics closely track Dáil-wide topic surges\n",
+      "Low score  = idiosyncratic focus, independent of what others are asking about"),
+    x = "Herd instinct score (mean cosine sim to monthly Dáil vector)",
+    y = "Members"
+  ) +
+  theme_minimal()
+```
+
+```{r herd-vs-focus}
+# Does herd instinct correlate with (or diverge from) the focus score?
+style_scores |>
+  inner_join(herd_scores, by = "member_name") |>
+  ggplot(aes(focus, herd_instinct, colour = party, label = member_name)) +
+  geom_point(size = 2.5, alpha = 0.85) +
+  geom_text_repel(size = 2.4, max.overlaps = 15, segment.colour = "grey75") +
+  geom_smooth(method = "lm", se = TRUE, colour = "grey40",
+              linetype = "dashed", linewidth = 0.8) +
+  scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
+  scale_x_continuous(labels = label_percent(accuracy = 1)) +
+  labs(
+    title    = "Focus score vs. herd instinct",
+    subtitle = paste0(
+      "Top-right = focused AND tracks Dáil trends (bandwagon rider on a single issue)\n",
+      "Bottom-left = unfocused AND independent (idiosyncratic generalist)"),
+    x      = "Focus score (normalised HHI)",
+    y      = "Herd instinct",
+    colour = "Party"
+  ) +
+  theme_minimal(base_size = 11)
+```
+
+---
+
+## 9  Pioneer Index — Who Sets the Agenda?
+
+Beyond tracking averages, we want to know who **raises topics before they
+become newsworthy** vs. who **piles on after the surge**.
+
+### Method
+
+1. For each domain, compute the Dáil-wide **monthly question rate** (questions
+   in that domain ÷ all questions that month).
+2. Detect **breakout months** — months where a domain's rate exceeds
+   1.5× its trailing 3-month average (a meaningful surge, not noise).
+3. For each breakout event, check which members were already asking above
+   their personal average in that domain **in the month before** the surge
+   (pioneers) vs. **in the month of or after** the surge (followers).
+4. **Pioneer index** = (pioneer events − follower events) / total events.
+   Ranges from −1 (pure follower) to +1 (pure pioneer).
+
+```{r pioneer}
+# ── Dáil-wide domain rate by month ──────────────────────────────────────────
+dail_rate <- domain_words |>
+  count(month, domain, name = "domain_n") |>
+  left_join(count(qs, month, name = "total_n"), by = "month") |>
+  mutate(rate = domain_n / total_n) |>
+  arrange(domain, month) |>
+  group_by(domain) |>
+  mutate(
+    trailing_avg = slider::slide_mean(rate, before = 3, after = 0,
+                                      complete = FALSE),
+    is_breakout  = rate > 1.5 * lag(trailing_avg, 1)
+  ) |>
+  ungroup()
+
+# ── Member monthly domain rate ───────────────────────────────────────────────
+member_rate <- domain_words |>
+  count(member_name, month, domain, name = "member_n") |>
+  left_join(count(qs, member_name, month, name = "member_total"),
+            by = c("member_name", "month")) |>
+  mutate(member_rate = member_n / member_total) |>
+  group_by(member_name, domain) |>
+  mutate(member_avg = mean(member_rate, na.rm = TRUE)) |>
+  ungroup()
+
+# ── Classify each member at each breakout event ──────────────────────────────
+breakout_events <- dail_rate |>
+  filter(is_breakout) |>
+  select(domain, breakout_month = month)
+
+# For each breakout, look at member activity in the month prior
+classify_at_breakout <- breakout_events |>
+  left_join(member_rate, by = "domain") |>
+  # The month prior to the breakout
+  mutate(
+    pre_month = format(as.Date(paste0(breakout_month, "-01")) - 31, "%Y-%m")
+  ) |>
+  filter(month == pre_month) |>
+  mutate(
+    was_active_pre = member_rate > member_avg,   # above their personal average
+    classification = if_else(was_active_pre, "pioneer", "follower")
+  )
+
+pioneer_index <- classify_at_breakout |>
+  group_by(member_name) |>
+  summarise(
+    n_pioneer  = sum(classification == "pioneer"),
+    n_follower = sum(classification == "follower"),
+    n_events   = n(),
+    pioneer_index = (n_pioneer - n_follower) / (n_events + 1e-9),
+    .groups = "drop"
+  ) |>
+  filter(n_events >= 3)   # need enough events to be meaningful
+```
+
+> **Note:** The `slider` package is required for `slider::slide_mean()`.
+> Install with `install.packages("slider")`.
+> As an alternative, replace with `zoo::rollmeanr()` or a manual 3-month
+> lag: `(lag(rate,1) + lag(rate,2) + lag(rate,3)) / 3`.
+
+```{r pioneer-plot}
+pioneer_index |>
+  left_join(select(members, member_name, party), by = "member_name") |>
+  slice_max(abs(pioneer_index), n = 40) |>
+  mutate(
+    member_name = reorder(member_name, pioneer_index),
+    direction   = if_else(pioneer_index >= 0, "Pioneer", "Follower")
+  ) |>
+  ggplot(aes(pioneer_index, member_name, fill = direction)) +
+  geom_col() +
+  geom_vline(xintercept = 0, colour = "grey40") +
+  scale_fill_manual(values = c("Pioneer" = "#26A69A", "Follower" = "#EF5350")) +
+  scale_x_continuous(labels = label_number(accuracy = 0.01)) +
+  labs(
+    title    = "Pioneer index — who sets vs. follows the agenda?",
+    subtitle = paste0(
+      "Positive = member was raising the topic before Dáil-wide surges\n",
+      "Negative = member piled on after the topic was already trending"),
+    x        = "Pioneer index  (−1 = pure follower · +1 = pure pioneer)",
+    y        = NULL, fill = NULL,
+    caption  = "Source: Oireachtas Open Data API — written questions 2023–2024"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "top")
+```
+
+---
+
+## 10  Combined Parliamentary Style Score
+
+Combine all four signals into a single **style summary table** for easy
+cross-comparison.
+
+```{r combined-table}
+# ── Final summary ─────────────────────────────────────────────────────────
+style_summary <- style_scores |>
+  inner_join(herd_scores,   by = "member_name") |>
+  left_join(pioneer_index |> select(member_name, pioneer_index),
+            by = "member_name") |>
+  left_join(select(dept_diversity, member_name, n_depts, depts_per_100q),
+            by = "member_name") |>
+  left_join(select(members, member_name, party, constituency),
+            by = "member_name") |>
+  mutate(
+    style_quadrant = case_when(
+      focus >= med_focus & consistency >= med_cons ~ "Deep specialist",
+      focus <  med_focus & consistency >= med_cons ~ "Steady generalist",
+      focus >= med_focus & consistency <  med_cons ~ "Bandwagon rider",
+      TRUE                                         ~ "Populist"
+    )
+  ) |>
+  select(member_name, party, constituency,
+         focus, consistency, herd_instinct, pioneer_index,
+         n_depts, top_domain, style_quadrant) |>
+  arrange(desc(focus), desc(consistency))
+
+# Print top specialists
+style_summary |>
+  filter(style_quadrant == "Deep specialist") |>
+  select(member_name, party, top_domain, focus, consistency,
+         herd_instinct, pioneer_index) |>
+  mutate(across(where(is.double), ~ round(.x, 3))) |>
+  print(n = 20)
+```
+
+### 10.1  Quadrant composition by party
+
+```{r quadrant-party}
+style_summary |>
+  count(party, style_quadrant) |>
+  group_by(party) |>
+  mutate(pct = n / sum(n) * 100) |>
+  ggplot(aes(style_quadrant, pct, fill = party)) +
+  geom_col(position = "dodge") +
+  scale_fill_manual(values = party_colours, na.value = "#BDBDBD") +
+  scale_y_continuous(labels = label_percent(scale = 1)) +
+  labs(
+    title    = "Parliamentary style quadrant composition by party",
+    subtitle = "% of each party's members in each quadrant",
+    x = NULL, y = "% of party members", fill = "Party"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(axis.text.x = element_text(angle = 15, hjust = 1))
+```
+
+### 10.2  Longitudinal view — are members becoming more or less focused?
+
+```{r longitudinal}
+# Compute HHI per member per year to spot drift
+annual_hhi <- domain_words |>
+  count(member_name, year, domain, name = "n") |>
+  group_by(member_name, year) |>
+  complete(domain = names(domains), fill = list(n = 0)) |>
+  mutate(share = n / (sum(n) + 1e-9)) |>
+  summarise(hhi_norm = (sum(share^2) - 1/K_DOMAINS) / (1 - 1/K_DOMAINS),
+            .groups = "drop")
+
+annual_hhi |>
+  inner_join(select(members, member_name, party), by = "member_name") |>
+  ggplot(aes(year, hhi_norm, group = member_name, colour = party)) +
+  geom_line(alpha = 0.4, linewidth = 0.6) +
+  stat_summary(aes(group = party), fun = mean,
+               geom = "line", linewidth = 1.2) +
+  stat_summary(aes(group = party), fun = mean,
+               geom = "point", size = 2.5) +
+  scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
+  scale_y_continuous(labels = label_number(accuracy = 0.01)) +
+  facet_wrap(~party, ncol = 4) +
+  labs(
+    title    = "Member focus score over time (by year)",
+    subtitle = "Thin lines = individual members · Bold line = party average",
+    x = NULL, y = "Focus score (normalised HHI)", colour = "Party"
+  ) +
+  theme_minimal(base_size = 10) +
+  theme(legend.position = "none")
+```
+
+---
+
+## Summary
+
+| Metric | Method | Interpretation |
+|--------|--------|---------------|
+| **Focus score** | Normalised HHI on domain shares | 1 = all questions in one domain |
+| **Consistency** | Mean consecutive-quarter cosine similarity | 1 = same topic distribution every quarter |
+| **Herd instinct** | Mean cosine sim to monthly Dáil-wide vector | High = mirrors parliamentary zeitgeist |
+| **Pioneer index** | Pre- vs. post-surge activity at breakout events | Positive = sets agenda; negative = follows |
+| **Style quadrant** | Focus × Consistency median split | 4 behavioural archetypes |
+
+The four archetypes:
+
+* **Deep specialist** — owns a brief, consistent over time, low herd instinct, often positive pioneer index
+* **Steady generalist** — broad portfolio but stable; the reliable workhorse
+* **Bandwagon rider** — concentrates on whichever topic is currently most salient, then pivots
+* **Populist** — broad AND reactive; questions spray across every topic as each one rises in headlines
+
+None of these labels is inherently pejorative — a responsive generalist
+serving a diverse constituency may rationally adopt a populist pattern.
+The value is in the transparency: constituents and journalists can see the
+pattern in the data rather than relying on the member's self-description.
