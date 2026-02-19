@@ -1,0 +1,667 @@
+---
+title: "Electoral Cycle Effects on Parliamentary Question Behaviour"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Electoral Cycle Effects on Parliamentary Question Behaviour}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse   = TRUE,
+  comment    = "#>",
+  eval       = FALSE,
+  fig.width  = 9,
+  fig.height = 6
+)
+```
+
+> **Note:** All code chunks require a live internet connection. Fetching two
+> years of written questions typically takes 10–20 seconds depending on volume
+> and API rate limits. All heavy computation runs locally once the data is
+> downloaded. No additional package dependencies beyond the standard
+> `oiReachtas` Suggests list are required.
+
+---
+
+## The Dual Incentive Problem
+
+TDs occupy a structurally awkward position. They are elected to a **national
+legislature** where their formal role is to scrutinise the executive, pass
+legislation, and debate policy. Yet they owe their seat to a specific
+multi-seat constituency where voters expect highly personal, localised
+service — fixing planning objections, chasing hospital waiting lists,
+attending every parish event.
+
+Political scientists call this the **dual mandate** (or the *clinician–
+legislator* tension in comparative work). In Ireland the tension is especially
+sharp because the single transferable vote in multi-seat constituencies forces
+co-partisans to compete against one another: a Fianna Fáil TD in Cork South-
+West must outrun not just Fine Gael but the other FF candidate on the same
+ticket.
+
+Parliamentary questions are the visible, public record of how TDs navigate
+this tension. A question to the Minister for Housing about a specific estate in
+Mullingar is simultaneously a national-legislature act *and* a constituency
+service signal broadcast to local media. The question **title** (`show_as`)
+that appears in the Oireachtas records is exactly what appears in the
+candidate's next leaflet.
+
+This vignette tests three hypotheses about how electoral proximity reshapes
+that behaviour:
+
+| # | Hypothesis | What we expect to see |
+|---|---|---|
+| (a) | **Volume spike** | Question counts rise sharply in the weeks before polling day |
+| (b) | **Topic shift** | Housing, welfare, and local-services topics displace abstract national ones as election nears |
+| (c) | **Government loyalty** | Members of government parties ask fewer critical questions of their own ministers regardless of proximity |
+
+We operationalise "electoral proximity" as **weeks to the nearest general
+election**, negative before polling day and positive after. We examine the
+two most recent Dáil elections: **8 February 2020** (33rd Dáil) and
+**29 November 2024** (34th Dáil).
+
+---
+
+## 1  Setup
+
+```{r libraries}
+library(oiReachtas)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(tidytext)
+```
+
+---
+
+## 2  Election Date Reference Table
+
+We hardcode the two most recent Irish general elections and write a helper
+that, given a vector of question dates, returns the signed distance in weeks
+to the nearest election.
+
+```{r election-dates}
+elections <- tibble(
+  election_name = c("2020 General Election (33rd Dáil)",
+                    "2024 General Election (34th Dáil)"),
+  election_date = as.Date(c("2020-02-08", "2024-11-29"))
+)
+
+# ── helper: signed weeks to nearest election ────────────────────────────────
+# Negative  = weeks BEFORE the election
+# Positive  = weeks AFTER  the election
+# The function finds whichever election is closest to each date and returns
+# that signed distance.
+weeks_to_nearest_election <- function(dates, election_tbl = elections) {
+  dates <- as.Date(dates)
+  # Matrix: rows = question dates, cols = elections
+  dist_mat <- map(election_tbl$election_date, ~ as.numeric(dates - .x) / 7)
+  dist_mat <- do.call(cbind, dist_mat)   # n_dates x n_elections
+
+  # For each date pick the election that minimises |distance|
+  nearest_idx <- apply(abs(dist_mat), 1, which.min)
+  signed_dist <- dist_mat[cbind(seq_along(nearest_idx), nearest_idx)]
+  round(signed_dist, 2)
+}
+```
+
+---
+
+## 3  Fetch the Question Corpus
+
+We pull **two years of written questions** spanning a window that brackets
+both the pre-2020 and pre-2024 run-ups. We then attach member metadata (party,
+constituency) and compute electoral proximity.
+
+```{r fetch-questions}
+# ── written questions: Jan 2019 – Dec 2024 ──────────────────────────────────
+# Fetch in two blocks to stay within API page limits
+qs_2019_2021 <- get_questions(
+  chamber       = "dail",
+  date_start    = "2019-01-01",
+  date_end      = "2021-12-31",
+  question_type = "written",
+  limit         = 100,
+  all_pages     = TRUE
+)
+
+qs_2022_2024 <- get_questions(
+  chamber       = "dail",
+  date_start    = "2022-01-01",
+  date_end      = "2024-12-31",
+  question_type = "written",
+  limit         = 100,
+  all_pages     = TRUE
+)
+
+qs_raw <- bind_rows(qs_2019_2021, qs_2022_2024)
+
+# ── member roster ────────────────────────────────────────────────────────────
+members <- get_members(chamber = "dail", limit = 300) |>
+  select(member_name, party = party_code, constituency)
+
+# ── join and compute electoral proximity ────────────────────────────────────
+qs <- qs_raw |>
+  mutate(date = as.Date(date)) |>
+  left_join(members, by = "member_name") |>
+  mutate(
+    weeks_to_elec  = weeks_to_nearest_election(date),
+    # Bin into 4-week periods for area charts (-26 to +26 covers ±6 months)
+    week_bin       = floor(weeks_to_elec / 4) * 4,
+    # Identify which election cycle each question belongs to
+    election_cycle = if_else(date < as.Date("2022-01-01"),
+                             "Pre-2020 election",
+                             "Pre-2024 election")
+  ) |>
+  filter(abs(weeks_to_elec) <= 26)  # ± 6-month window
+
+glimpse(qs)
+```
+
+---
+
+## 4  Hypothesis (a): Question Volume Spike Before Elections
+
+We aggregate weekly question counts and plot them against weeks-to-election.
+The vertical line marks polling day (week 0). A positive slope approaching
+week 0 would support the volume-spike hypothesis.
+
+```{r volume-by-week, fig.height=5}
+weekly_vol <- qs |>
+  mutate(week_int = floor(weeks_to_elec)) |>
+  count(week_int, name = "n_questions")
+
+ggplot(weekly_vol, aes(x = week_int, y = n_questions)) +
+  geom_col(fill = "#2c7bb6", alpha = 0.65, width = 0.85) +
+  geom_smooth(aes(group = 1),
+              method  = "loess",
+              span    = 0.35,
+              colour  = "#d7191c",
+              linewidth = 1.1,
+              se      = TRUE,
+              fill    = "#d7191c",
+              alpha   = 0.12) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "black",
+             linewidth = 0.8) +
+  annotate("text", x = 1, y = max(weekly_vol$n_questions, na.rm = TRUE) * 0.95,
+           label = "Polling day", hjust = 0, size = 3.2, colour = "black") +
+  scale_x_continuous(
+    breaks = seq(-26, 26, by = 4),
+    labels = function(x) paste0(x, "w")
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Written Question Volume Relative to Polling Day",
+    subtitle = "Weekly counts pooled across 2020 and 2024 Irish general elections",
+    x        = "Weeks to nearest election (negative = before)",
+    y        = "Number of written questions",
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+```
+
+---
+
+## 5  Hypothesis (b): Topic Composition Shift Near Elections
+
+We reuse the ten-domain keyword lookup from the member-profiling vignette and
+track the **share of domain-tagged questions** in each 4-week bin. A rising
+share for housing, social welfare, or local services as week 0 approaches
+would support the topic-shift hypothesis.
+
+```{r domain-keywords}
+domains <- list(
+  "Housing & Planning"    = c("housing", "rent", "home", "tenant", "landlord",
+                               "accommodation", "planning", "homeless", "eviction",
+                               "hap", "hal", "rents", "residential", "development"),
+  "Health & HSE"          = c("health", "hospital", "hse", "waiting", "gp",
+                               "mental", "nursing", "cancer", "ambulance", "pharmacy",
+                               "disability", "maternity", "beds", "staffing"),
+  "Education"             = c("school", "teacher", "education", "college",
+                               "university", "student", "special", "sen", "curriculum",
+                               "principal", "snc", "sna", "class", "pupil"),
+  "Transport"             = c("road", "bus", "train", "rail", "cycle", "traffic",
+                               "transport", "motorway", "greenway", "brt", "luas",
+                               "dart", "airport", "port"),
+  "Environment & Climate" = c("climate", "carbon", "emission", "renewable",
+                               "energy", "wind", "solar", "waste", "water", "flood",
+                               "biodiversity", "nature", "offshore", "fossil"),
+  "Social Welfare"        = c("welfare", "pension", "disability", "carer",
+                               "benefit", "payment", "allowance", "dsp", "social",
+                               "lone", "jobseeker", "community", "poverty"),
+  "Justice & Crime"       = c("garda", "crime", "court", "prison", "legal",
+                               "justice", "solicitor", "judge", "offence", "victim",
+                               "drugs", "trafficking", "violence", "fraud"),
+  "Agriculture & Rural"   = c("farmer", "farm", "agri", "dairy", "beef", "rural",
+                               "fishing", "forestry", "land", "mart", "tillage",
+                               "dafm", "animal", "felling"),
+  "Enterprise & Economy"  = c("enterprise", "business", "sme", "employment",
+                               "job", "tax", "vat", "trade", "investment", "startup",
+                               "export", "ibec", "isme", "commercial"),
+  "Foreign & Defence"     = c("foreign", "ukraine", "conflict", "israel",
+                               "palestine", "nato", "defence", "international",
+                               "humanitarian", "migration", "asylum", "refugee",
+                               "embassy", "united")
+)
+
+domain_lookup <- imap_dfr(domains, ~ tibble(word = .x, domain = .y))
+```
+
+```{r topic-shift}
+# Tokenise show_as titles
+tidy_qs <- qs |>
+  select(question_id, date, week_bin, show_as) |>
+  unnest_tokens(word, show_as) |>
+  anti_join(stop_words, by = "word")
+
+# Assign domain tags
+domain_by_bin <- tidy_qs |>
+  inner_join(domain_lookup, by = "word") |>
+  count(week_bin, domain, name = "n_domain") |>
+  group_by(week_bin) |>
+  mutate(share = n_domain / sum(n_domain)) |>
+  ungroup()
+
+# Highlight domains of interest for electoral salience
+salient_domains <- c("Housing & Planning", "Social Welfare",
+                     "Health & HSE", "Transport")
+
+domain_plot_data <- domain_by_bin |>
+  mutate(domain_grp = if_else(domain %in% salient_domains,
+                              domain, "Other domains"))
+
+ggplot(domain_plot_data,
+       aes(x = week_bin, y = share, fill = domain_grp)) +
+  geom_area(position = "stack", alpha = 0.82) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "black",
+             linewidth = 0.9) +
+  scale_x_continuous(
+    breaks = seq(-24, 24, by = 4),
+    labels = function(x) paste0(x, "w")
+  ) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_manual(
+    values = c(
+      "Housing & Planning"    = "#2c7bb6",
+      "Social Welfare"        = "#abd9e9",
+      "Health & HSE"          = "#fdae61",
+      "Transport"             = "#d7191c",
+      "Other domains"         = "#cccccc"
+    )
+  ) +
+  labs(
+    title    = "Policy Domain Composition of Written Questions by Electoral Proximity",
+    subtitle = "4-week bins; stacked area = share of domain-tagged questions",
+    x        = "Weeks to nearest election (negative = before)",
+    y        = "Share of domain-tagged questions",
+    fill     = "Policy domain",
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  ) +
+  guides(fill = guide_legend(nrow = 2))
+```
+
+---
+
+## 6  Hypothesis (c): Government vs Opposition Question Behaviour
+
+Members of the governing coalition face a structural disincentive to ask
+critical questions of their own ministers — doing so embarrasses colleagues,
+undermines collective responsibility, and risks career consequences. We test
+whether this suppression effect varies with electoral proximity.
+
+For the **33rd Dáil** the coalition was Fianna Fáil (FF), Fine Gael (FG), and
+the Green Party (GP). For the **34th Dáil** coalition formation was ongoing at
+the end of the data window; we tentatively assign FF and FG to government and
+treat Sinn Féin (SF) as opposition.
+
+```{r govt-opposition}
+# Government party assignments per Dáil
+govt_parties_33rd <- c("FF", "FG", "GP")    # FF/FG/GP coalition
+govt_parties_34th <- c("FF", "FG")           # provisional; SF in opposition
+
+# Classify each question by govt/opposition status at time of asking
+qs_gov <- qs |>
+  mutate(
+    dail_period = if_else(date < as.Date("2020-06-27"),
+                          "33rd Dáil", "34th Dáil"),
+    govt_member = case_when(
+      dail_period == "33rd Dáil" & party %in% govt_parties_33rd ~ TRUE,
+      dail_period == "34th Dáil" & party %in% govt_parties_34th ~ TRUE,
+      TRUE                                                        ~ FALSE
+    ),
+    member_status = if_else(govt_member, "Government", "Opposition")
+  ) |>
+  filter(!is.na(party))
+
+# Weekly question volume by status
+weekly_by_status <- qs_gov |>
+  mutate(week_int = floor(weeks_to_elec)) |>
+  count(week_int, member_status, name = "n_questions")
+
+ggplot(weekly_by_status,
+       aes(x = week_int, y = n_questions,
+           colour = member_status, fill = member_status)) +
+  geom_col(position = "dodge", alpha = 0.70, width = 0.75) +
+  geom_smooth(method   = "loess",
+              span     = 0.4,
+              se       = FALSE,
+              linewidth = 1.1) +
+  geom_vline(xintercept = 0, linetype = "dashed", colour = "black",
+             linewidth = 0.8) +
+  scale_colour_manual(values = c("Government" = "#1a9641",
+                                 "Opposition" = "#d7191c")) +
+  scale_fill_manual(values   = c("Government" = "#1a9641",
+                                 "Opposition" = "#d7191c")) +
+  scale_x_continuous(
+    breaks = seq(-26, 26, by = 4),
+    labels = function(x) paste0(x, "w")
+  ) +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Written Question Volume: Government vs Opposition Members",
+    subtitle = "Weekly counts pooled across 2020 and 2024 election windows",
+    x        = "Weeks to nearest election (negative = before)",
+    y        = "Number of written questions",
+    colour   = "Member status",
+    fill     = "Member status",
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "top",
+    panel.grid.minor = element_blank()
+  )
+```
+
+---
+
+## 7  Member-Level Electoral Responsiveness
+
+Not all TDs respond equally to electoral proximity. We define an
+**electoral responsiveness ratio** (ERR) for each member as:
+
+$$\text{ERR} = \frac{\text{questions in the 8 weeks before election}}
+                    {\text{questions in the 8 weeks earlier (weeks -16 to -8)}}$$
+
+Members with ERR > 1 ramped up activity as the election approached; those
+with ERR ≈ 1 maintained steady effort; those with ERR < 1 wound down early.
+The chart surfaces the 20 most electorally responsive members.
+
+```{r err-by-member}
+# Window definitions (signed weeks to nearest election)
+pre_election_window <- c(-8, 0)      # final 8 weeks before polling
+baseline_window     <- c(-16, -8)    # 8 weeks earlier
+
+err_data <- qs |>
+  filter(!is.na(party)) |>
+  mutate(
+    period = case_when(
+      weeks_to_elec >= baseline_window[1]     &
+        weeks_to_elec <  baseline_window[2]   ~ "baseline",
+      weeks_to_elec >= pre_election_window[1] &
+        weeks_to_elec <  pre_election_window[2] ~ "pre_election",
+      TRUE                                    ~ NA_character_
+    )
+  ) |>
+  filter(!is.na(period)) |>
+  count(member_name, party, period, name = "n_questions") |>
+  pivot_wider(names_from = period, values_from = n_questions,
+              values_fill = 0) |>
+  # Require at least 5 questions in the baseline to avoid noise
+  filter(baseline >= 5) |>
+  mutate(err = pre_election / baseline) |>
+  arrange(desc(err))
+
+# Top 20 most electorally responsive members
+top20_err <- slice_head(err_data, n = 20) |>
+  mutate(member_name = fct_reorder(member_name, err))
+
+# Party colour palette (standard Irish political colours)
+party_colours <- c(
+  "FF"  = "#006400",   # Fianna Fáil — green
+  "FG"  = "#003DA5",   # Fine Gael — blue
+  "SF"  = "#326760",   # Sinn Féin — dark teal
+  "GP"  = "#99C140",   # Green Party — lime green
+  "Lab" = "#CC0000",   # Labour — red
+  "SD"  = "#7B2D8B",   # Social Democrats — purple
+  "PBP" = "#8B0000",   # People Before Profit — dark red
+  "Ind" = "#999999",   # Independents — grey
+  "AON" = "#FF6600",   # Aontú — orange
+  "NP"  = "#CCCCCC"    # No party / other
+)
+
+ggplot(top20_err,
+       aes(x = err, y = member_name,
+           fill = party)) +
+  geom_col(alpha = 0.85) +
+  geom_vline(xintercept = 1, linetype = "dashed",
+             colour = "grey30", linewidth = 0.8) +
+  scale_fill_manual(values = party_colours, na.value = "#CCCCCC") +
+  scale_x_continuous(labels = number_format(accuracy = 0.1)) +
+  annotate("text", x = 1.02, y = 1,
+           label = "ERR = 1\n(no change)", hjust = 0,
+           size = 2.9, colour = "grey30") +
+  labs(
+    title    = "Top 20 Most Electorally Responsive TDs",
+    subtitle = "Electoral Responsiveness Ratio = questions in final 8 weeks ÷ baseline 8 weeks",
+    x        = "Electoral Responsiveness Ratio (ERR)",
+    y        = NULL,
+    fill     = "Party",
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "right",
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+---
+
+## 8  Longitudinal Comparison: 2020 vs 2024 Run-Up
+
+Do the patterns repeat across election cycles? We overlay the weekly question
+volume trajectories for the 24 weeks before each election, normalised per
+sitting TD to account for different Dáil sizes.
+
+```{r longitudinal-comparison}
+# Assign each question to its nearest election cycle
+qs_cycles <- qs |>
+  mutate(
+    cycle = case_when(
+      abs(date - as.Date("2020-02-08")) <= abs(date - as.Date("2024-11-29"))
+        ~ "Pre-2020 (33rd Dáil)",
+      TRUE
+        ~ "Pre-2024 (34th Dáil)"
+    )
+  ) |>
+  # Keep only the pre-election window for the comparison
+  filter(weeks_to_elec >= -24 & weeks_to_elec < 0)
+
+# Approximate TD counts per cycle for normalisation
+cycle_td_counts <- tibble(
+  cycle    = c("Pre-2020 (33rd Dáil)", "Pre-2024 (34th Dáil)"),
+  n_tds    = c(160L, 174L)           # approx. seats at dissolution
+)
+
+longitudinal_vol <- qs_cycles |>
+  mutate(week_int = floor(weeks_to_elec)) |>
+  count(cycle, week_int, name = "n_questions") |>
+  left_join(cycle_td_counts, by = "cycle") |>
+  mutate(q_per_td = n_questions / n_tds)
+
+ggplot(longitudinal_vol,
+       aes(x = week_int, y = q_per_td,
+           colour = cycle, group = cycle)) +
+  geom_line(linewidth = 1.0, alpha = 0.85) +
+  geom_point(size = 1.8, alpha = 0.7) +
+  geom_smooth(method   = "loess",
+              span     = 0.45,
+              se       = FALSE,
+              linewidth = 0.5,
+              linetype = "dashed") +
+  geom_vline(xintercept = 0, linetype = "dashed",
+             colour = "black", linewidth = 0.8) +
+  scale_colour_manual(values = c("Pre-2020 (33rd Dáil)" = "#2c7bb6",
+                                 "Pre-2024 (34th Dáil)" = "#d7191c")) +
+  scale_x_continuous(
+    breaks = seq(-24, 0, by = 4),
+    labels = function(x) paste0(x, "w")
+  ) +
+  scale_y_continuous(labels = number_format(accuracy = 0.01)) +
+  labs(
+    title    = "Pre-Election Question Surge: 2020 vs 2024",
+    subtitle = "Weekly written questions per sitting TD, final 24 weeks before polling day",
+    x        = "Weeks to election",
+    y        = "Written questions per TD",
+    colour   = "Election cycle",
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "top",
+    panel.grid.minor = element_blank()
+  )
+```
+
+---
+
+## 9  Summary of Findings
+
+```{r findings-table, eval=FALSE}
+# Compute headline statistics for a findings summary
+findings <- tribble(
+  ~hypothesis,     ~metric,                            ~expected_sign,
+  "(a) Volume spike",
+    "Pearson r: weekly questions ~ weeks_to_elec (pre-election only)",
+    "Negative (more Qs as election nears)",
+  "(b) Topic shift",
+    "Change in housing+welfare share: bin[-8,0] vs bin[-24,-16]",
+    "Positive (higher share near election)",
+  "(c) Government loyalty",
+    "Govt Q volume / Opposition Q volume ratio near election",
+    "< 1 (govt members ask fewer Qs)"
+)
+
+# Compute (a)
+cor_a <- qs |>
+  filter(weeks_to_elec >= -26, weeks_to_elec < 0) |>
+  mutate(week_int = floor(weeks_to_elec)) |>
+  count(week_int) |>
+  summarise(r = cor(week_int, n, method = "pearson")) |>
+  pull(r)
+
+# Compute (b)
+share_shift <- domain_by_bin |>
+  filter(domain %in% c("Housing & Planning", "Social Welfare")) |>
+  group_by(week_bin) |>
+  summarise(combined_share = sum(share), .groups = "drop") |>
+  summarise(
+    near_election = mean(combined_share[week_bin >= -8 & week_bin < 0]),
+    early_window  = mean(combined_share[week_bin >= -24 & week_bin < -16])
+  ) |>
+  mutate(shift = near_election - early_window)
+
+# Compute (c)
+vol_ratio <- weekly_by_status |>
+  filter(week_int >= -8, week_int < 0) |>
+  group_by(member_status) |>
+  summarise(total = sum(n_questions), .groups = "drop") |>
+  pivot_wider(names_from = member_status, values_from = total) |>
+  mutate(ratio = Government / Opposition)
+
+cat("=== Hypothesis (a) — Volume spike ===\n")
+cat("  Pearson r (weekly count ~ weeks to election, pre-election):",
+    round(cor_a, 3), "\n")
+cat("  Interpretation: r < 0 supports H(a)\n\n")
+
+cat("=== Hypothesis (b) — Topic shift ===\n")
+cat("  Housing+Welfare share change (early vs near-election):",
+    round(share_shift$shift * 100, 1), "pp\n")
+cat("  Interpretation: positive shift supports H(b)\n\n")
+
+cat("=== Hypothesis (c) — Government loyalty ===\n")
+cat("  Govt/Opposition question ratio (final 8 weeks):",
+    round(vol_ratio$ratio, 3), "\n")
+cat("  Interpretation: ratio < 1 supports H(c)\n")
+```
+
+---
+
+## 10  Caveats and Limitations
+
+Several features of the parliamentary calendar and question system complicate
+a clean causal interpretation of these patterns.
+
+**Parliamentary recess.** The Dáil does not sit continuously. The summer
+recess (roughly July–September) and Christmas recess (roughly late December–
+early January) produce zero-question weeks that have nothing to do with
+electoral incentives. A dissolved Dáil similarly generates no questions.
+Ensure that any trend model conditions on sitting weeks, or at minimum flags
+zero-activity weeks as structural rather than behavioural zeros.
+
+**Question allocation limits.** The Oireachtas Business Committee sets limits
+on the number of questions each member may table per week, which varies by
+standing order period and by whether questions are oral or written. A surge in
+*submitted* questions could be partially absorbed by scheduling, so observed
+*answered* question counts are a censored measure of member effort.
+
+**Strategic timing.** Not all pre-election questions are electorally motivated.
+Ministers are required to answer questions tabled before dissolution even
+after an election is called, so members may front-load high-priority questions
+for administrative rather than electoral reasons.
+
+**Coalition uncertainty.** Government membership changes at dissolution and
+again after negotiation. The classification of members as government or
+opposition is therefore uncertain in the weeks immediately before and after
+polling day, particularly for parties that might enter multiple different
+coalitions across the two cycles examined here.
+
+**Selection on questions asked.** Questions visible in the API are *tabled*
+questions — those accepted and scheduled. Questions withdrawn, ruled
+inadmissible, or never submitted are unobservable. If electoral pressure
+causes members to submit more questions simultaneously (hoping some get
+scheduled), the API record understates the true surge.
+
+**Individual vs collective incentives.** Members in safe seats or retiring
+members face very different incentive gradients. Ideally the volume and topic
+analyses should be stratified by seat marginality, but constituency-level
+vote-share data would need to be matched from an external election results
+database.
+
+---
+
+## Further Reading
+
+- Gallagher, M. & Komito, L. (2010). *The constituency role of TDs.* In
+  Gallagher & Coakley (eds.), *Politics in the Republic of Ireland*, 5th ed.
+- Martin, S. (2011). *Electoral incentives and parliamentary activity: lessons
+  from the Irish case.* Parliamentary Affairs, 64(3), 512–534.
+- Saalfeld, T. (2011). *Parliamentary questions as instruments of substantive
+  representation.* Journal of Legislative Studies, 17(3), 295–322.
+- Oireachtas Open Data API documentation: <https://data.oireachtas.ie>
+
+---
+
+```{r session-info}
+sessionInfo()
+```

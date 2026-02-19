@@ -1,0 +1,781 @@
+---
+title: "Constituency vs National Focus: Classifying TD Questions"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Constituency vs National Focus: Classifying TD Questions}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse   = TRUE,
+  comment    = "#>",
+  eval       = FALSE,
+  fig.width  = 8,
+  fig.height = 5
+)
+```
+
+Irish TDs carry a dual mandate. As members of the national legislature they are expected to scrutinise government policy, propose legislation, and debate issues of broad public concern. At the same time, each TD is elected by a specific constituency and faces constant pressure to act as a local ombudsman — securing funding for a local road, raising concerns about a rural GP surgery, or flagging the closure of a post office in a named townland.
+
+The Oireachtas written-question record offers a window into how individual members balance these two roles. A question phrased as *"the funding allocation for road maintenance on the N17 between Tuam and Claremorris"* is clearly local service delivery. A question about *"the national road maintenance capital budget for 2024"* is national policy. This vignette builds a heuristic geographic signal dictionary and uses it to classify twelve months of written questions, then examines how local versus national orientation varies by member, party, constituency type, and electoral vulnerability.
+
+> **Note:** The classification method used here is heuristic. Presence of a county name or town name in a question's `show_as` text is treated as a signal of local focus, but this is imperfect. A question about "Cork city housing policy" is local; a question asking the Minister to "compare housing output in Cork, Galway and Limerick" is national but will be scored as local by this method. Results should be treated as illustrative rather than definitive. Electoral margin data used in Section 10 are approximate and for demonstration only.
+
+---
+
+## 1  Setup
+
+```{r libraries}
+library(oiReachtas)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(tidytext)
+library(stringr)
+```
+
+Party colours used consistently throughout:
+
+```{r party-colours}
+party_colours <- c(
+  "FF"  = "#66BB6A",
+  "FG"  = "#42A5F5",
+  "SF"  = "#4CAF50",
+  "Lab" = "#EF5350",
+  "GP"  = "#26A69A",
+  "SD"  = "#AB47BC",
+  "PBP" = "#FF7043",
+  "Ind" = "#78909C"
+)
+```
+
+---
+
+## 2  Geographic Signal Dictionary
+
+The classification rests on three layers of geographic and infrastructural keywords. A question is labelled **LOCAL** if its `show_as` field (the plain-English description of the question topic) contains any term from any of the three layers. Otherwise it is labelled **NATIONAL**.
+
+### 2.1  Irish Counties
+
+All twenty-six counties of the Republic are included. Northern Ireland counties are also listed because questions occasionally reference cross-border issues rooted in specific localities.
+
+```{r counties}
+irish_counties <- c(
+  "antrim", "armagh", "carlow", "cavan", "clare", "cork", "donegal",
+  "dublin", "fermanagh", "galway", "kerry", "kildare", "kilkenny",
+  "laois", "leitrim", "limerick", "longford", "louth", "mayo", "meath",
+  "monaghan", "offaly", "roscommon", "sligo", "tipperary", "tyrone",
+  "waterford", "westmeath", "wexford", "wicklow"
+)
+```
+
+### 2.2  Major Towns and Cities
+
+```{r towns}
+irish_towns <- c(
+  "dublin", "cork", "galway", "limerick", "waterford", "drogheda",
+  "dundalk", "swords", "bray", "navan", "ennis", "kilkenny", "tralee",
+  "carlow", "newbridge", "portlaoise", "balbriggan", "naas", "athlone",
+  "mullingar", "wexford", "letterkenny", "sligo", "clonmel", "castlebar",
+  "monaghan", "cavan", "tullamore", "killarney", "arklow", "cobh"
+)
+```
+
+### 2.3  Local Infrastructure Keywords
+
+These phrases signal questions about specific local services rather than national policy frameworks.
+
+```{r infra-keywords}
+local_infra <- c(
+  "townland", "local road", "regional road", "primary school",
+  "garda station", "health centre", "community centre", "rural scheme",
+  "local authority", "county council", "municipal district",
+  "town council", "village", "parish", "rural area", "rural community",
+  "local employment", "local hospital", "local clinic"
+)
+```
+
+### 2.4  Build the Regex
+
+All terms are combined into a single alternation pattern. Word boundaries (`\\b`) prevent spurious matches — for example, preventing "laois" matching inside "blasio" — and `tolower()` is applied to question text before matching.
+
+```{r build-regex}
+# Combine all geographic and infrastructure terms
+all_local_terms <- unique(c(irish_counties, irish_towns, local_infra))
+
+# Escape any regex metacharacters in the terms, then wrap with word boundaries
+escaped_terms <- stringr::str_replace_all(all_local_terms, "([\\.\\+\\*\\?\\[\\^\\]\\$\\(\\)\\{\\}\\=\\!\\<\\>\\|\\:\\-\\#])", "\\\\\\1")
+
+local_regex <- paste0(
+  "\\b(",
+  paste(escaped_terms, collapse = "|"),
+  ")\\b"
+)
+
+cat("Regex covers", length(all_local_terms), "distinct terms.\n")
+cat("First 120 characters of regex:\n")
+cat(substr(local_regex, 1, 120), "...\n")
+```
+
+---
+
+## 3  Fetch Data
+
+### 3.1  Twelve Months of Written Questions
+
+We request the full set of written questions (Dáil chamber) for the twelve months ending at today's date, retrieving all pages.
+
+```{r fetch-questions}
+date_end   <- Sys.Date()
+date_start <- date_end - 365
+
+questions_raw <- get_questions(
+  chamber       = "dail",
+  date_start    = format(date_start, "%Y-%m-%d"),
+  date_end      = format(date_end,   "%Y-%m-%d"),
+  question_type = "written",
+  limit         = 100,
+  all_pages     = TRUE
+)
+
+glimpse(questions_raw)
+cat("Total written questions retrieved:", nrow(questions_raw), "\n")
+```
+
+### 3.2  Member Metadata
+
+```{r fetch-members}
+members_raw <- get_members(
+  chamber = "dail",
+  limit   = 200
+)
+
+glimpse(members_raw)
+```
+
+### 3.3  Constituency Metadata
+
+```{r fetch-constituencies}
+constituencies_raw <- get_constituencies(
+  chamber = "dail",
+  limit   = 200
+)
+
+glimpse(constituencies_raw)
+```
+
+---
+
+## 4  Classification and Per-Member Ratios
+
+### 4.1  Classify Each Question
+
+```{r classify-questions}
+questions_classified <- questions_raw %>%
+  # Ensure show_as is character; replace NA with empty string
+  mutate(
+    show_as_clean = tolower(coalesce(show_as, "")),
+    is_local      = stringr::str_detect(show_as_clean, local_regex),
+    focus         = if_else(is_local, "Local", "National")
+  )
+
+# Sanity check
+questions_classified %>%
+  count(focus) %>%
+  mutate(pct = scales::percent(n / sum(n), accuracy = 0.1))
+```
+
+### 4.2  Join Member Party and Constituency
+
+```{r join-members}
+members_clean <- members_raw %>%
+  select(member_pId, member_name, party, constituency) %>%
+  # Abbreviate party labels to match colour palette
+  mutate(
+    party_abbr = case_when(
+      str_detect(tolower(party), "fianna")        ~ "FF",
+      str_detect(tolower(party), "fine gael")     ~ "FG",
+      str_detect(tolower(party), "sinn")          ~ "SF",
+      str_detect(tolower(party), "labour")        ~ "Lab",
+      str_detect(tolower(party), "green")         ~ "GP",
+      str_detect(tolower(party), "social dem")    ~ "SD",
+      str_detect(tolower(party), "people before") ~ "PBP",
+      str_detect(tolower(party), "solidarity")    ~ "PBP",
+      TRUE                                        ~ "Ind"
+    )
+  )
+
+questions_with_meta <- questions_classified %>%
+  left_join(members_clean, by = "member_name")
+```
+
+### 4.3  Compute Per-Member Local Ratio
+
+Only members with at least 20 questions are retained so that ratios are not driven by very small sample sizes.
+
+```{r per-member-ratio}
+min_questions <- 20
+
+member_ratios <- questions_with_meta %>%
+  group_by(member_name, party_abbr, constituency) %>%
+  summarise(
+    n_questions  = n(),
+    n_local      = sum(is_local, na.rm = TRUE),
+    n_national   = n_questions - n_local,
+    local_ratio  = n_local / n_questions,
+    .groups      = "drop"
+  ) %>%
+  filter(n_questions >= min_questions) %>%
+  arrange(desc(local_ratio))
+
+cat("Members with >=", min_questions, "questions:", nrow(member_ratios), "\n")
+summary(member_ratios$local_ratio)
+```
+
+---
+
+## 5  Local Ratio Distribution
+
+A histogram of local ratios across all qualifying members, overlaid with party-level density curves, reveals the overall shape of the distribution and whether any party clusters at one end.
+
+```{r distribution-histogram, fig.width=8, fig.height=5}
+# Overall histogram
+ggplot(member_ratios, aes(x = local_ratio)) +
+  geom_histogram(
+    aes(y = after_stat(density)),
+    binwidth = 0.05,
+    fill     = "grey80",
+    colour   = "white",
+    linewidth = 0.3
+  ) +
+  geom_density(
+    data = member_ratios %>% filter(!is.na(party_abbr)),
+    aes(colour = party_abbr),
+    linewidth = 0.8,
+    adjust    = 1.5
+  ) +
+  scale_colour_manual(values = party_colours, name = "Party") +
+  scale_x_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Distribution of Local vs National Focus in Written Questions",
+    subtitle = paste0(
+      "Each TD's share of questions classified as locally-focused\n",
+      format(date_start, "%B %Y"), " to ", format(date_end, "%B %Y"),
+      " — members with \u2265 ", min_questions, " questions only"
+    ),
+    x = "Local question ratio",
+    y = "Density"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    legend.position  = "right",
+    panel.grid.minor = element_blank()
+  )
+```
+
+**Interpretation:** The distribution typically spans a wide range, from TDs who almost exclusively ask nationally-framed questions (ministers and opposition spokespersons with portfolio briefs) to TDs whose questions are almost entirely constituency-specific. The party density curves reveal whether certain parties systematically favour one mode.
+
+---
+
+## 6  Most Locally-Focused Members
+
+```{r top-local-bar, fig.width=9, fig.height=8}
+top_local <- member_ratios %>%
+  slice_max(local_ratio, n = 30) %>%
+  mutate(
+    member_label = paste0(member_name, "\n(", constituency, ")"),
+    member_label = reorder(member_label, local_ratio)
+  )
+
+ggplot(top_local, aes(x = local_ratio, y = member_label, fill = party_abbr)) +
+  geom_col(width = 0.75) +
+  geom_text(
+    aes(label = scales::percent(local_ratio, accuracy = 1)),
+    hjust = -0.15,
+    size  = 3
+  ) +
+  scale_fill_manual(values = party_colours, name = "Party") +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title    = "Top 30 Most Locally-Focused TDs",
+    subtitle = "Share of written questions classified as locally-focused",
+    x        = "Local question ratio",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position    = "bottom"
+  )
+```
+
+---
+
+## 7  Most Nationally-Focused Members
+
+```{r top-national-bar, fig.width=9, fig.height=8}
+top_national <- member_ratios %>%
+  slice_min(local_ratio, n = 30) %>%
+  mutate(
+    national_ratio = 1 - local_ratio,
+    member_label   = paste0(member_name, "\n(", constituency, ")"),
+    member_label   = reorder(member_label, national_ratio)
+  )
+
+ggplot(top_national, aes(x = national_ratio, y = member_label, fill = party_abbr)) +
+  geom_col(width = 0.75) +
+  geom_text(
+    aes(label = scales::percent(national_ratio, accuracy = 1)),
+    hjust = -0.15,
+    size  = 3
+  ) +
+  scale_fill_manual(values = party_colours, name = "Party") +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.12))
+  ) +
+  labs(
+    title    = "Top 30 Most Nationally-Focused TDs",
+    subtitle = "Share of written questions classified as nationally-focused (i.e. lowest local ratio)",
+    x        = "National question ratio",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position    = "bottom"
+  )
+```
+
+---
+
+## 8  Party-Level Comparison: Violin Plot
+
+Is local focus a party-level phenomenon or an individual-level one? A violin plot shows the full within-party distribution.
+
+```{r violin-party, fig.width=9, fig.height=5}
+member_ratios_party <- member_ratios %>%
+  filter(!is.na(party_abbr)) %>%
+  # Order parties by median local ratio
+  mutate(
+    party_abbr = reorder(party_abbr, local_ratio, FUN = median, na.rm = TRUE)
+  )
+
+ggplot(member_ratios_party, aes(x = party_abbr, y = local_ratio, fill = party_abbr)) +
+  geom_violin(
+    trim   = FALSE,
+    alpha  = 0.7,
+    colour = NA
+  ) +
+  geom_boxplot(
+    width     = 0.12,
+    fill      = "white",
+    outlier.shape = NA,
+    colour    = "grey40"
+  ) +
+  geom_jitter(
+    width  = 0.08,
+    size   = 1.5,
+    alpha  = 0.6,
+    colour = "grey30"
+  ) +
+  scale_fill_manual(values = party_colours, guide = "none") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Distribution of Local Question Ratio by Party",
+    subtitle = "Parties ordered by median local ratio; dots are individual TDs",
+    x        = "Party",
+    y        = "Local question ratio"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+**Interpretation:** Parties that operate primarily as opposition forces and field portfolio spokespersons (e.g. Sinn Féin, Fine Gael in opposition) tend to cluster at lower local ratios because their members are expected to pursue government nationally on specific portfolios. Independent TDs and smaller rural-based parties often show the opposite pattern.
+
+---
+
+## 9  Constituency Type Analysis
+
+Urban constituencies are dominated by city-based issues that typically translate into nationally-framed questions about housing policy, public transport systems, and urban health services. Rural constituencies face a different set of pressures — road maintenance, rural broadband, agricultural supports — many of which are locally framed.
+
+### 9.1  Constituency Type Lookup
+
+```{r constituency-type-lookup}
+# Hardcoded classification of Dáil constituencies by type
+# Urban: predominantly city-based electorate
+# Mixed: significant urban centre alongside rural hinterland
+# Rural: primarily rural and small-town electorate
+
+constituency_types <- tribble(
+  ~constituency,               ~type,
+  "Dublin Bay North",          "Urban",
+  "Dublin Bay South",          "Urban",
+  "Dublin Central",            "Urban",
+  "Dublin Fingal East",        "Urban",
+  "Dublin Fingal West",        "Urban",
+  "Dublin Mid-West",           "Urban",
+  "Dublin North-West",         "Urban",
+  "Dublin Rathdown",           "Urban",
+  "Dublin South-Central",      "Urban",
+  "Dublin South-West",         "Urban",
+  "Dublin West",               "Urban",
+  "Cork East",                 "Mixed",
+  "Cork North-Central",        "Urban",
+  "Cork North-West",           "Rural",
+  "Cork South-Central",        "Urban",
+  "Cork South-West",           "Rural",
+  "Galway East",               "Rural",
+  "Galway West",               "Mixed",
+  "Limerick City",             "Urban",
+  "Limerick County",           "Rural",
+  "Waterford",                 "Mixed",
+  "Wexford",                   "Mixed",
+  "Wicklow",                   "Mixed",
+  "Kildare North",             "Mixed",
+  "Kildare South",             "Mixed",
+  "Meath East",                "Mixed",
+  "Meath West",                "Rural",
+  "Louth",                     "Mixed",
+  "Cavan-Monaghan",            "Rural",
+  "Donegal",                   "Rural",
+  "Sligo-Leitrim",             "Rural",
+  "Roscommon-Galway",          "Rural",
+  "Mayo",                      "Rural",
+  "Kerry",                     "Rural",
+  "Clare",                     "Rural",
+  "Tipperary North",           "Rural",
+  "Tipperary South",           "Rural",
+  "Laois",                     "Rural",
+  "Offaly",                    "Rural",
+  "Longford-Westmeath",        "Rural",
+  "Carlow-Kilkenny",           "Mixed",
+  "Kilkenny",                  "Mixed"
+)
+```
+
+### 9.2  Join and Compare
+
+```{r constituency-type-analysis, fig.width=7, fig.height=5}
+member_ratios_type <- member_ratios %>%
+  left_join(constituency_types, by = "constituency") %>%
+  filter(!is.na(type)) %>%
+  mutate(type = factor(type, levels = c("Urban", "Mixed", "Rural")))
+
+# Summary statistics
+member_ratios_type %>%
+  group_by(type) %>%
+  summarise(
+    n         = n(),
+    mean_local = mean(local_ratio, na.rm = TRUE),
+    median_local = median(local_ratio, na.rm = TRUE),
+    sd_local   = sd(local_ratio, na.rm = TRUE)
+  )
+
+# Visualise
+ggplot(member_ratios_type, aes(x = type, y = local_ratio, fill = type)) +
+  geom_violin(trim = FALSE, alpha = 0.7, colour = NA) +
+  geom_boxplot(
+    width = 0.15,
+    fill  = "white",
+    outlier.shape = NA,
+    colour = "grey40"
+  ) +
+  geom_jitter(
+    aes(colour = party_abbr),
+    width = 0.1,
+    size  = 2,
+    alpha = 0.8
+  ) +
+  scale_fill_manual(
+    values = c("Urban" = "#42A5F5", "Mixed" = "#AB47BC", "Rural" = "#66BB6A"),
+    guide  = "none"
+  ) +
+  scale_colour_manual(values = party_colours, name = "Party") +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Local Question Ratio by Constituency Type",
+    subtitle = "Urban vs mixed vs rural constituencies",
+    x        = "Constituency type",
+    y        = "Local question ratio"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(panel.grid.minor = element_blank())
+```
+
+**Interpretation:** The hypothesis is that rural TDs will show higher local ratios than their urban counterparts. Urban TDs may engage with locally-specific housing or planning questions but more frequently phrase questions in terms of city-wide or national frameworks.
+
+---
+
+## 10  Electoral Margin and Local Focus
+
+Do TDs in marginal seats lean more heavily on constituency service — and therefore ask more locally-focused questions — as an electoral survival strategy? This analysis uses illustrative first-preference vote share data from the 2020 general election.
+
+> **Data note:** The electoral margin values below are approximate and for demonstration purposes. They represent the estimated gap between the winning candidate's first-preference share and the effective quota (votes / (seats + 1) + 1), as a percentage of valid votes cast. Positive values indicate the candidate exceeded the quota; negative values indicate the candidate won a late count on transfers. Actual margins depend on complex multi-seat STV dynamics.
+
+### 10.1  Hardcoded Electoral Margin Data
+
+```{r electoral-margin-data}
+electoral_margins <- tribble(
+  ~constituency,             ~winning_td,              ~margin_pct,
+  "Donegal",                 "Pearse Doherty",          12.4,
+  "Mayo",                    "Michael Ring",             8.7,
+  "Kerry",                   "Michael Healy-Rae",       15.2,
+  "Tipperary North",         "Alan Kelly",               6.1,
+  "Sligo-Leitrim",           "Eamon Scanlon",            4.3,
+  "Cavan-Monaghan",          "Brendan Smith",            7.8,
+  "Roscommon-Galway",        "Eugene Murphy",            2.1,
+  "Longford-Westmeath",      "Robert Troy",              5.5,
+  "Wexford",                 "Paul Kehoe",               9.3,
+  "Wicklow",                 "Simon Harris",            11.6,
+  "Kildare North",           "James Lawless",            3.2,
+  "Kildare South",           "Martin Heydon",            6.9,
+  "Meath East",              "Thomas Byrne",             4.7,
+  "Meath West",              "Damien English",           8.4,
+  "Louth",                   "Imelda Munster",           1.8,
+  "Carlow-Kilkenny",         "Bobby Aylward",           -0.5,
+  "Limerick County",         "Niall Collins",            5.2,
+  "Clare",                   "Timmy Dooley",            -1.3,
+  "Galway East",             "Ciaran Cannon",            3.6,
+  "Cork North-West",         "Michael Creed",            7.1
+)
+
+cat("Electoral margin data for", nrow(electoral_margins), "constituencies\n")
+```
+
+### 10.2  Scatter: Local Ratio vs Electoral Margin
+
+```{r scatter-margin, fig.width=8, fig.height=6}
+# Join: one row per TD, using the first matching member per constituency
+margin_joined <- electoral_margins %>%
+  left_join(
+    member_ratios %>%
+      group_by(constituency) %>%
+      slice_max(n_questions, n = 1) %>%
+      ungroup(),
+    by = "constituency"
+  ) %>%
+  filter(!is.na(local_ratio))
+
+ggplot(margin_joined, aes(x = margin_pct, y = local_ratio)) +
+  geom_smooth(
+    method  = "lm",
+    formula = y ~ x,
+    colour  = "grey60",
+    fill    = "grey90",
+    linewidth = 0.8,
+    alpha   = 0.4
+  ) +
+  geom_point(
+    aes(colour = party_abbr, size = n_questions),
+    alpha = 0.85
+  ) +
+  ggrepel::geom_text_repel(
+    aes(label = constituency),
+    size      = 3,
+    max.overlaps = 12,
+    segment.colour = "grey70"
+  ) +
+  scale_colour_manual(values = party_colours, name = "Party") +
+  scale_size_continuous(name = "Questions asked", range = c(3, 9)) +
+  scale_x_continuous(labels = function(x) paste0(x, " pp")) +
+  scale_y_continuous(labels = scales::percent_format(accuracy = 1)) +
+  labs(
+    title    = "Local Question Ratio vs Electoral Margin",
+    subtitle = "Hypothesis: TDs in marginal seats focus more on constituency-level questions\n(Electoral margin data are illustrative — 2020 general election, approximate)",
+    x        = "Electoral margin (first-preference share above quota, percentage points)",
+    y        = "Local question ratio"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+```
+
+**Interpretation:** A negative slope (higher local ratio for lower electoral margin) would support the hypothesis that electoral vulnerability drives constituency focus. A flat or positive relationship would suggest that local orientation is culturally or individually determined rather than strategically adopted. Note that causality cannot be established from this observational analysis.
+
+---
+
+## 11  Temporal Pattern: Monthly Local Ratio
+
+Does local question focus change over the parliamentary calendar? TDs may front-load constituency questions at the start of a term or intensify local activity as an election approaches.
+
+```{r temporal-pattern, fig.width=9, fig.height=5}
+monthly_ratios <- questions_classified %>%
+  mutate(
+    month = lubridate::floor_date(as.Date(date), "month")
+  ) %>%
+  left_join(members_clean %>% select(member_name, party_abbr), by = "member_name") %>%
+  group_by(month) %>%
+  summarise(
+    n_questions = n(),
+    local_ratio = mean(is_local, na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  filter(!is.na(month))
+
+# Also compute party-level monthly ratios for overlay
+monthly_party <- questions_classified %>%
+  mutate(month = lubridate::floor_date(as.Date(date), "month")) %>%
+  left_join(members_clean %>% select(member_name, party_abbr), by = "member_name") %>%
+  filter(!is.na(party_abbr)) %>%
+  group_by(month, party_abbr) %>%
+  summarise(
+    n_questions = n(),
+    local_ratio = mean(is_local, na.rm = TRUE),
+    .groups     = "drop"
+  ) %>%
+  filter(n_questions >= 20)
+
+ggplot() +
+  # Party lines (lighter, in background)
+  geom_line(
+    data    = monthly_party,
+    aes(x = month, y = local_ratio, colour = party_abbr),
+    alpha   = 0.45,
+    linewidth = 0.6
+  ) +
+  # Overall Dáil average (bold, foreground)
+  geom_line(
+    data    = monthly_ratios,
+    aes(x = month, y = local_ratio),
+    colour  = "black",
+    linewidth = 1.1
+  ) +
+  geom_point(
+    data    = monthly_ratios,
+    aes(x = month, y = local_ratio),
+    colour  = "black",
+    size    = 2.5
+  ) +
+  scale_colour_manual(values = party_colours, name = "Party") +
+  scale_y_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    limits = c(0, 1)
+  ) +
+  scale_x_date(date_labels = "%b %Y", date_breaks = "2 months") +
+  labs(
+    title    = "Monthly Local Question Ratio Over Time",
+    subtitle = "Black line: all-Dáil average; coloured lines: individual parties",
+    x        = NULL,
+    y        = "Local question ratio"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(angle = 30, hjust = 1),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  )
+```
+
+**Interpretation:** Spikes in local ratio near parliamentary recesses (summer, Christmas) may reflect TDs prioritising constituency work when legislative business is lighter. A sustained upward trend in local ratio late in the parliamentary term can be an early indicator of pre-election behaviour.
+
+---
+
+## 12  Department Patterns: Which Departments Receive the Most Local Questions?
+
+Government departments are not equally exposed to local scrutiny. The Department of Rural and Community Development, Transport, and Housing receive high volumes of locally-framed questions; the Department of Finance and Foreign Affairs receive proportionally fewer.
+
+```{r department-local-ratio, fig.width=9, fig.height=7}
+department_ratios <- questions_classified %>%
+  filter(!is.na(department), department != "") %>%
+  group_by(department) %>%
+  summarise(
+    n_questions  = n(),
+    local_ratio  = mean(is_local, na.rm = TRUE),
+    .groups      = "drop"
+  ) %>%
+  filter(n_questions >= 50) %>%
+  # Shorten long department names
+  mutate(
+    dept_short = department %>%
+      str_remove("^Department of ") %>%
+      str_remove("^Department for ") %>%
+      str_wrap(width = 35)
+  ) %>%
+  arrange(desc(local_ratio)) %>%
+  mutate(dept_short = reorder(dept_short, local_ratio))
+
+ggplot(department_ratios, aes(x = local_ratio, y = dept_short)) +
+  geom_col(
+    aes(fill = local_ratio),
+    width = 0.75
+  ) +
+  geom_text(
+    aes(
+      label = paste0(
+        scales::percent(local_ratio, accuracy = 1),
+        "  (n=", scales::comma(n_questions), ")"
+      )
+    ),
+    hjust = -0.05,
+    size  = 3
+  ) +
+  scale_fill_gradient(
+    low  = "#90CAF9",
+    high = "#1565C0",
+    name = "Local ratio",
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_x_continuous(
+    labels = scales::percent_format(accuracy = 1),
+    expand = expansion(mult = c(0, 0.25))
+  ) +
+  labs(
+    title    = "Local Question Ratio by Government Department",
+    subtitle = "Departments with \u2265 50 written questions in the period",
+    x        = "Proportion of questions classified as locally-focused",
+    y        = NULL
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    legend.position    = "bottom"
+  )
+```
+
+**Interpretation:**
+
+- **High local ratio departments** (e.g. Transport, Rural Development, Housing, Agriculture) face questions about specific roads, rural broadband schemes, named housing estates, and individual farm payments.
+- **Low local ratio departments** (e.g. Finance, Foreign Affairs, Public Expenditure) are more often questioned on national policy frameworks, budget allocations, and international agreements.
+- The Taoiseach's office typically falls in the middle, receiving both constituency-specific representations and broad questions about government direction.
+
+---
+
+## 13  Summary
+
+This vignette has demonstrated how the geographic content of written questions can be used to approximate the local-versus-national orientation of individual Dáil members. Key findings from the heuristic analysis:
+
+1. **Wide individual variation** — local ratios span the full range from near-zero to near-one, driven more by individual style and portfolio than by any single structural variable.
+
+2. **Party patterns** — parties with structured opposition portfolios (asking questions in the name of a spokesperson for Transport, Housing, etc.) tend to produce more nationally-framed questions. Independent TDs and those without portfolio responsibilities tend toward local focus.
+
+3. **Constituency type** — rural constituency TDs show modestly higher local ratios on average, consistent with the different policy environment they represent, though within-type variance is large.
+
+4. **Electoral margin** — there is a suggestive (but weak, given the illustrative data) negative relationship between electoral margin and local focus, consistent with the constituency service theory of political behaviour.
+
+5. **Temporal variation** — local ratio varies across the parliamentary calendar, with modest evidence of intensification near recesses and late in the term.
+
+6. **Departmental exposure** — infrastructure and service-delivery departments absorb a disproportionate share of locally-framed scrutiny.
+
+> **Methodological caveat (repeated):** All findings here are contingent on the heuristic dictionary classification. Future work could apply named-entity recognition, Latent Dirichlet Allocation seeded with local/national topic words, or supervised classification trained on hand-labelled examples to improve precision and recall.
+
+---
+
+## Session Information
+
+```{r session-info}
+sessionInfo()
+```

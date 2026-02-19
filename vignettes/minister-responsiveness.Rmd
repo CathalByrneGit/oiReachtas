@@ -1,0 +1,759 @@
+---
+title: "Ministerial Responsiveness: Deflection, Verbosity, and Clarity in Oral Questions"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Ministerial Responsiveness: Deflection, Verbosity, and Clarity in Oral Questions}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  collapse  = TRUE,
+  comment   = "#>",
+  eval      = FALSE,
+  fig.width  = 9,
+  fig.height = 6
+)
+```
+
+> **Note:** All code chunks require a live internet connection. Fetching
+> three months of oral-question debate transcripts typically takes 20–40
+> seconds (full-text XML is retrieved per debate). All intermediate objects
+> are built in-session; re-run `fetch-debates` and `fetch-text` chunks to
+> refresh the corpus.
+
+---
+
+## What Makes a Good Ministerial Answer?
+
+When a TD asks an oral question in the Dáil, the minister's reply can be
+evaluated on at least three measurable dimensions that together capture the
+quality of democratic accountability:
+
+| Dimension | What it measures | Good score |
+|---|---|---|
+| **Verbosity** | Word count of the answer | Moderate — too short is dismissive, too long buries the point |
+| **Deflection** | Cosine similarity between question TF-IDF and answer TF-IDF | High — a responsive answer shares topic vocabulary with the question |
+| **Clarity** | Flesch-Kincaid readability of the answer | High — accessible prose scores higher |
+
+Together these three axes produce a *ministerial responsiveness scorecard*:
+a minister who gives long, jargon-heavy answers that are topically unrelated
+to the question asked is deflecting through verbosity and complexity.
+
+```
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  Ideal answer                                                    │
+  │     • moderate length   (not one-line brush-off, not wall of text)│
+  │     • high cosine sim   (vocabulary overlaps with the question)   │
+  │     • high readability  (Flesch-Kincaid ≥ 40)                    │
+  └──────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 1  Setup
+
+```{r libraries}
+library(oiReachtas)
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(ggrepel)
+library(scales)
+library(tidytext)
+
+# Party colour palette ── used throughout for consistent visual identity
+party_colours <- c(
+  FF  = "#66BB6A",
+  FG  = "#42A5F5",
+  SF  = "#4CAF50",
+  Lab = "#EF5350",
+  GP  = "#26A69A",
+  SD  = "#AB47BC",
+  PBP = "#FF7043",
+  Ind = "#78909C"
+)
+```
+
+---
+
+## 2  Fetch Oral Question Debate Transcripts
+
+We use a three-month window. `get_debates()` returns one row per debate
+section; those with `debate_type == "oral_questions"` contain the Q&A
+exchanges we want. The `formats_xml` column holds the URI we pass to
+`get_debate_text()` to retrieve the full transcript.
+
+```{r fetch-debates}
+# ── 1.  Discover oral-question debates ──────────────────────────────────────
+debates_raw <- get_debates(
+  chamber    = "dail",
+  date_start = "2024-01-01",
+  date_end   = "2024-03-31",
+  limit      = 500,
+  all_pages  = TRUE
+)
+
+# Keep only oral-question sections that have an XML transcript URI
+oral_debates <- debates_raw |>
+  filter(debate_type == "oral_questions",
+         !is.na(formats_xml),
+         formats_xml != "")
+
+cat(sprintf("Found %d oral-question debate sections.\n", nrow(oral_debates)))
+```
+
+```{r fetch-text}
+# ── 2.  Retrieve full transcript for each debate section ────────────────────
+#
+#  get_debate_text() is called with by_para = FALSE so we get one row per
+#  speech rather than one row per paragraph — easier to pair Q with A.
+#
+#  We use purrr::map() over formats_xml and bind results together.
+
+fetch_safe <- possibly(
+  .f = function(uri) get_debate_text(uri, by_para = FALSE),
+  otherwise = NULL
+)
+
+transcripts_raw <- oral_debates |>
+  select(debate_id, date, section_title, formats_xml) |>
+  mutate(
+    transcript = map(formats_xml, fetch_safe)
+  ) |>
+  filter(!map_lgl(transcript, is.null)) |>
+  unnest(transcript)
+
+# Confirm columns present
+glimpse(transcripts_raw)
+# Expected: section_id, section_heading, speech_no, speech_type,
+#           speaker_ref, speaker_uri, speaker_name, para_no, text
+```
+
+---
+
+## 3  Pair Questions with Answers
+
+Each oral question and its corresponding ministerial answer share the same
+`section_id`. We split the transcript into question speeches and answer
+speeches, then join them by `section_id` so every row contains both the
+question text and the answer text for that exchange.
+
+```{r pair-qa}
+# ── Keep only question and answer speech types ───────────────────────────────
+qa_speeches <- transcripts_raw |>
+  filter(speech_type %in% c("question", "answer"),
+         !is.na(text),
+         nchar(trimws(text)) > 0)
+
+# ── Split into questions and answers ─────────────────────────────────────────
+questions_df <- qa_speeches |>
+  filter(speech_type == "question") |>
+  group_by(section_id) |>
+  summarise(
+    question_text  = paste(text, collapse = " "),
+    questioner     = first(speaker_name),
+    .groups        = "drop"
+  )
+
+answers_df <- qa_speeches |>
+  filter(speech_type == "answer") |>
+  group_by(section_id) |>
+  summarise(
+    answer_text    = paste(text, collapse = " "),
+    minister_name  = first(speaker_name),
+    minister_ref   = first(speaker_ref),
+    .groups        = "drop"
+  )
+
+# ── Join on section_id; attach date and department metadata ──────────────────
+qa_pairs <- questions_df |>
+  inner_join(answers_df, by = "section_id") |>
+  left_join(
+    transcripts_raw |>
+      distinct(section_id, date, section_heading, debate_id),
+    by = "section_id"
+  ) |>
+  # Extract department from section_heading (typically "Minister for X")
+  mutate(
+    department = stringr::str_extract(
+      section_heading,
+      "(?<=Minister for )([^–—-]+)"
+    ) |> trimws()
+  )
+
+cat(sprintf("Paired %d question–answer exchanges across %d debate sections.\n",
+            nrow(qa_pairs),
+            n_distinct(qa_pairs$debate_id)))
+```
+
+---
+
+## 4  Answer Length: Verbosity by Department
+
+Word count is the most direct measure of how much (or how little) a minister
+actually said. A violin plot shows the full distribution within each
+department, revealing whether verbosity is minister-specific or department-
+wide.
+
+```{r answer-length}
+# ── Compute word counts ───────────────────────────────────────────────────────
+qa_pairs <- qa_pairs |>
+  mutate(
+    answer_words   = stringr::str_count(answer_text,   "\\S+"),
+    question_words = stringr::str_count(question_text, "\\S+")
+  )
+
+# ── Summarise at department level for ordering ────────────────────────────────
+dept_order <- qa_pairs |>
+  filter(!is.na(department)) |>
+  group_by(department) |>
+  summarise(median_words = median(answer_words, na.rm = TRUE),
+            .groups = "drop") |>
+  arrange(median_words) |>
+  pull(department)
+
+plot_verbosity <- qa_pairs |>
+  filter(!is.na(department),
+         answer_words > 0,
+         answer_words < quantile(answer_words, 0.99, na.rm = TRUE)) |>
+  mutate(department = factor(department, levels = dept_order))
+
+ggplot(plot_verbosity, aes(x = department, y = answer_words)) +
+  geom_violin(fill = "#42A5F5", alpha = 0.6, colour = "white", scale = "width") +
+  geom_boxplot(width = 0.12, outlier.shape = NA,
+               fill = "white", colour = "#1565C0", linewidth = 0.4) +
+  coord_flip() +
+  scale_y_continuous(labels = comma) +
+  labs(
+    title    = "Ministerial Answer Length by Department",
+    subtitle = "Oral questions, Dáil Éireann · Jan–Mar 2024",
+    x        = NULL,
+    y        = "Words in ministerial answer",
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold")
+  )
+```
+
+---
+
+## 5  Deflection Score: Cosine Similarity of Question vs Answer
+
+A minister who actually answers the question will use vocabulary related to
+what was asked. We measure this with **cosine similarity** between the TF-IDF
+vectors of the question text and the answer text within the same `section_id`.
+
+A score near **1** means the answer is topically aligned with the question;
+a score near **0** means the answer shares almost no vocabulary with what was
+asked — a strong signal of deflection.
+
+```{r cosine-sim-helper}
+# ── Cosine similarity helper ──────────────────────────────────────────────────
+#
+#  Inputs:  two named numeric vectors (TF-IDF weights, names = terms)
+#  Output:  scalar in [0, 1]
+
+cosine_sim <- function(a, b) {
+  # Keep only terms that appear in both vectors
+  common <- intersect(names(a), names(b))
+  if (length(common) == 0L) return(0)
+  a_c  <- a[common]
+  b_c  <- b[common]
+  dot  <- sum(a_c * b_c)
+  norm <- sqrt(sum(a^2)) * sqrt(sum(b^2))
+  if (norm == 0) return(0)
+  dot / norm
+}
+```
+
+```{r deflection}
+# ── Tokenise and compute TF-IDF for each speech within a section ─────────────
+
+# We treat each section_id as a "document" and compute separate TF-IDF
+# vectors for the question and the answer.
+
+stop_words_oir <- c(
+  tidytext::stop_words$word,
+  "minister", "question", "dáil", "ask", "asked", "will", "can",
+  "government", "department", "ireland", "irish"
+)
+
+tfidf_questions <- qa_pairs |>
+  select(section_id, text = question_text) |>
+  unnest_tokens(word, text) |>
+  filter(!word %in% stop_words_oir, nchar(word) > 2) |>
+  count(section_id, word) |>
+  bind_tf_idf(word, section_id, n)
+
+tfidf_answers <- qa_pairs |>
+  select(section_id, text = answer_text) |>
+  unnest_tokens(word, text) |>
+  filter(!word %in% stop_words_oir, nchar(word) > 2) |>
+  count(section_id, word) |>
+  bind_tf_idf(word, section_id, n)
+
+# ── Compute cosine similarity per section_id ──────────────────────────────────
+section_ids <- intersect(
+  unique(tfidf_questions$section_id),
+  unique(tfidf_answers$section_id)
+)
+
+deflection_scores <- map_dfr(section_ids, function(sid) {
+  q_vec <- tfidf_questions |>
+    filter(section_id == sid) |>
+    select(word, tf_idf) |>
+    tibble::deframe()
+
+  a_vec <- tfidf_answers |>
+    filter(section_id == sid) |>
+    select(word, tf_idf) |>
+    tibble::deframe()
+
+  tibble(
+    section_id  = sid,
+    cosine_sim  = cosine_sim(q_vec, a_vec)
+  )
+})
+
+# ── Attach to main pairs table ────────────────────────────────────────────────
+qa_pairs <- qa_pairs |>
+  left_join(deflection_scores, by = "section_id")
+
+# ── Distribution of deflection scores ────────────────────────────────────────
+ggplot(qa_pairs, aes(x = cosine_sim)) +
+  geom_histogram(bins = 40, fill = "#AB47BC", colour = "white", alpha = 0.85) +
+  geom_vline(xintercept = median(qa_pairs$cosine_sim, na.rm = TRUE),
+             linetype = "dashed", colour = "#6A1B9A", linewidth = 0.8) +
+  annotate("text",
+           x     = median(qa_pairs$cosine_sim, na.rm = TRUE) + 0.02,
+           y     = Inf, vjust = 1.5, hjust = 0,
+           label = sprintf("Median = %.2f",
+                           median(qa_pairs$cosine_sim, na.rm = TRUE)),
+           colour = "#6A1B9A", size = 3.5) +
+  scale_x_continuous(limits = c(0, 1), labels = number_format(accuracy = 0.01)) +
+  labs(
+    title    = "Distribution of Deflection Scores (Cosine Similarity)",
+    subtitle = "Higher = answer vocabulary aligns with question; lower = deflection",
+    x        = "Cosine similarity (question TF-IDF vs answer TF-IDF)",
+    y        = "Number of Q&A exchanges",
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold")
+  )
+```
+
+---
+
+## 6  Readability: Flesch-Kincaid Score
+
+The **Flesch-Kincaid Reading Ease** formula rates text on a 0–100 scale;
+higher scores mean the text is easier to read. We implement it directly in
+R without additional packages.
+
+```
+  FK = 206.835 − 1.015 × (words / sentences) − 84.6 × (syllables / words)
+```
+
+Syllables are approximated by counting contiguous vowel groups in each word
+(a robust heuristic that works well for parliamentary English).
+
+```{r readability-helper}
+# ── Syllable counter (vowel-group heuristic) ──────────────────────────────────
+count_syllables <- function(word) {
+  word  <- tolower(trimws(word))
+  # Remove trailing silent 'e' before counting
+  word  <- sub("e$", "", word)
+  # Count vowel groups
+  groups <- stringr::str_count(word, "[aeiouy]+")
+  # Every word has at least one syllable
+  pmax(groups, 1L)
+}
+
+# ── Flesch-Kincaid Reading Ease ───────────────────────────────────────────────
+#  Input:  character vector of one or more paragraphs / speeches
+#  Output: scalar FK score
+
+flesch_kincaid <- function(text) {
+  text <- paste(text, collapse = " ")
+
+  # ── Sentence count: split on .  !  ? ──────────────────────────────────────
+  sentences <- stringr::str_split(text, "[.!?]+")[[1]]
+  sentences <- sentences[nchar(trimws(sentences)) > 0]
+  n_sent    <- max(length(sentences), 1L)
+
+  # ── Word tokens ────────────────────────────────────────────────────────────
+  words     <- unlist(stringr::str_split(text, "\\s+"))
+  words     <- words[nchar(trimws(words)) > 0]
+  # Strip punctuation from each token before syllable counting
+  words     <- stringr::str_replace_all(words, "[^a-zA-Z]", "")
+  words     <- words[nchar(words) > 0]
+  n_words   <- max(length(words), 1L)
+
+  # ── Syllable count ─────────────────────────────────────────────────────────
+  n_syll    <- sum(count_syllables(words))
+
+  # ── FK formula ─────────────────────────────────────────────────────────────
+  206.835 - 1.015 * (n_words / n_sent) - 84.6 * (n_syll / n_words)
+}
+```
+
+```{r apply-readability}
+# ── Apply FK score to every answer ───────────────────────────────────────────
+qa_pairs <- qa_pairs |>
+  mutate(
+    fk_score = map_dbl(answer_text, flesch_kincaid)
+  )
+
+# Clamp to [0, 100] — outliers from very short or malformed text
+qa_pairs <- qa_pairs |>
+  mutate(fk_score = pmax(0, pmin(100, fk_score)))
+
+# ── Mean readability per minister ─────────────────────────────────────────────
+readability_by_minister <- qa_pairs |>
+  filter(!is.na(minister_name)) |>
+  group_by(minister_name, department) |>
+  summarise(
+    mean_fk      = mean(fk_score,    na.rm = TRUE),
+    median_fk    = median(fk_score,  na.rm = TRUE),
+    n_answers    = n(),
+    .groups      = "drop"
+  ) |>
+  filter(n_answers >= 5) |>          # require at least 5 exchanges for stability
+  arrange(desc(mean_fk))
+
+# ── Lollipop: top and bottom 10 by readability ────────────────────────────────
+readability_plot <- bind_rows(
+  slice_max(readability_by_minister, mean_fk, n = 10),
+  slice_min(readability_by_minister, mean_fk, n = 10)
+) |>
+  distinct() |>
+  mutate(
+    minister_name = forcats::fct_reorder(minister_name, mean_fk),
+    label_pos     = ifelse(mean_fk > 50, mean_fk - 1.5, mean_fk + 1.5),
+    hjust_val     = ifelse(mean_fk > 50, 1, 0)
+  )
+
+ggplot(readability_plot,
+       aes(x = mean_fk, y = minister_name, colour = mean_fk)) +
+  geom_segment(aes(x = 0, xend = mean_fk, yend = minister_name),
+               linewidth = 0.6, colour = "grey80") +
+  geom_point(size = 3.5) +
+  scale_colour_gradient(low = "#EF5350", high = "#26A69A",
+                        name = "FK score", limits = c(0, 100)) +
+  scale_x_continuous(limits = c(0, 100), breaks = seq(0, 100, 20)) +
+  labs(
+    title    = "Ministerial Answer Readability (Flesch-Kincaid)",
+    subtitle = "Higher score = easier to read · top and bottom 10 ministers shown",
+    x        = "Mean Flesch-Kincaid Reading Ease score",
+    y        = NULL,
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank(),
+    plot.title         = element_text(face = "bold"),
+    legend.position    = "right"
+  )
+```
+
+---
+
+## 7  Combined Minister Scorecard: Bubble Chart
+
+We now bring all three dimensions together. First we build a per-minister
+summary, then we attach party labels from `get_members()` and render a
+bubble chart where:
+
+- **x-axis** = mean deflection score (cosine similarity)
+- **y-axis** = mean readability (Flesch-Kincaid)
+- **bubble size** = mean answer length (word count)
+- **colour** = party affiliation
+
+```{r scorecard-data}
+# ── Per-minister summary ──────────────────────────────────────────────────────
+minister_scorecard <- qa_pairs |>
+  filter(!is.na(minister_name)) |>
+  group_by(minister_name, department) |>
+  summarise(
+    mean_cosine    = mean(cosine_sim,   na.rm = TRUE),
+    mean_fk        = mean(fk_score,     na.rm = TRUE),
+    mean_words     = mean(answer_words, na.rm = TRUE),
+    n_exchanges    = n(),
+    .groups        = "drop"
+  ) |>
+  filter(n_exchanges >= 5)
+
+# ── Attach party from member roster ──────────────────────────────────────────
+members <- get_members(chamber = "dail", limit = 200) |>
+  select(member_name, party)
+
+minister_scorecard <- minister_scorecard |>
+  left_join(members, by = "minister_name") |>
+  mutate(party = coalesce(party, "Ind"))
+
+# Map party codes to the canonical short forms used in party_colours
+minister_scorecard <- minister_scorecard |>
+  mutate(
+    party_code = case_when(
+      stringr::str_detect(party, regex("fianna|FF",  ignore_case = TRUE)) ~ "FF",
+      stringr::str_detect(party, regex("fine gael|FG", ignore_case = TRUE)) ~ "FG",
+      stringr::str_detect(party, regex("sinn féin|SF", ignore_case = TRUE)) ~ "SF",
+      stringr::str_detect(party, regex("labour|Lab",   ignore_case = TRUE)) ~ "Lab",
+      stringr::str_detect(party, regex("green|GP",     ignore_case = TRUE)) ~ "GP",
+      stringr::str_detect(party, regex("social dem|SD", ignore_case = TRUE)) ~ "SD",
+      stringr::str_detect(party, regex("people before|PBP", ignore_case = TRUE)) ~ "PBP",
+      TRUE ~ "Ind"
+    )
+  )
+```
+
+```{r scorecard-plot}
+# ── Bubble chart ──────────────────────────────────────────────────────────────
+ggplot(minister_scorecard,
+       aes(x      = mean_cosine,
+           y      = mean_fk,
+           size   = mean_words,
+           colour = party_code,
+           label  = minister_name)) +
+  # Reference lines at medians
+  geom_hline(yintercept = median(minister_scorecard$mean_fk,    na.rm = TRUE),
+             linetype = "dashed", colour = "grey70", linewidth = 0.4) +
+  geom_vline(xintercept = median(minister_scorecard$mean_cosine, na.rm = TRUE),
+             linetype = "dashed", colour = "grey70", linewidth = 0.4) +
+  # Quadrant annotations
+  annotate("text", x = 0.02, y = 95, label = "Clear & deflecting",
+           hjust = 0, vjust = 1, colour = "grey55", size = 3, fontface = "italic") +
+  annotate("text", x = 0.98, y = 95, label = "Clear & responsive",
+           hjust = 1, vjust = 1, colour = "grey55", size = 3, fontface = "italic") +
+  annotate("text", x = 0.02, y = 5,  label = "Opaque & deflecting",
+           hjust = 0, vjust = 0, colour = "grey55", size = 3, fontface = "italic") +
+  annotate("text", x = 0.98, y = 5,  label = "Opaque & responsive",
+           hjust = 1, vjust = 0, colour = "grey55", size = 3, fontface = "italic") +
+  geom_point(alpha = 0.75) +
+  geom_text_repel(size = 2.8, max.overlaps = 15,
+                  segment.colour = "grey70", segment.size = 0.3,
+                  show.legend = FALSE) +
+  scale_colour_manual(values = party_colours, name = "Party",
+                      drop = FALSE) +
+  scale_size_continuous(range = c(3, 14), name = "Mean answer\nlength (words)",
+                        labels = comma) +
+  scale_x_continuous(limits = c(0, 1),
+                     labels = number_format(accuracy = 0.01),
+                     name   = "Mean deflection score (cosine similarity ↑ = more responsive)") +
+  scale_y_continuous(limits = c(0, 100),
+                     name   = "Mean readability (Flesch-Kincaid ↑ = clearer)") +
+  labs(
+    title    = "Ministerial Responsiveness Scorecard",
+    subtitle = "Oral questions · Dáil Éireann · Jan–Mar 2024 · ministers with ≥ 5 exchanges",
+    caption  = "Bubble size = mean answer word count · Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    panel.grid.minor = element_blank(),
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "right"
+  )
+```
+
+---
+
+## 8  Department-Level Heatmap
+
+The bubble chart shows minister-level variation; the heatmap aggregates to
+department level and normalises each metric to [0, 1] so the three dimensions
+are directly comparable on a single scale.
+
+```{r heatmap-data}
+# ── Department-level summary ──────────────────────────────────────────────────
+dept_summary <- qa_pairs |>
+  filter(!is.na(department)) |>
+  group_by(department) |>
+  summarise(
+    mean_cosine = mean(cosine_sim,   na.rm = TRUE),
+    mean_fk     = mean(fk_score,     na.rm = TRUE),
+    mean_words  = mean(answer_words, na.rm = TRUE),
+    n_exchanges = n(),
+    .groups     = "drop"
+  ) |>
+  filter(n_exchanges >= 10)           # at least 10 exchanges per department
+
+# ── Min-max normalise each metric to [0, 1] ──────────────────────────────────
+norm01 <- function(x) {
+  rng <- range(x, na.rm = TRUE)
+  if (diff(rng) == 0) return(rep(0.5, length(x)))
+  (x - rng[1]) / diff(rng)
+}
+
+dept_normalised <- dept_summary |>
+  mutate(
+    deflection_norm  = norm01(mean_cosine),
+    readability_norm = norm01(mean_fk),
+    verbosity_norm   = norm01(mean_words)
+  ) |>
+  select(department,
+         Deflection   = deflection_norm,
+         Readability  = readability_norm,
+         Verbosity    = verbosity_norm) |>
+  pivot_longer(
+    cols      = c(Deflection, Readability, Verbosity),
+    names_to  = "metric",
+    values_to = "score_norm"
+  )
+
+# Order departments by combined score (sum of normalised metrics)
+dept_order_heat <- dept_normalised |>
+  group_by(department) |>
+  summarise(total = sum(score_norm), .groups = "drop") |>
+  arrange(total) |>
+  pull(department)
+
+dept_normalised <- dept_normalised |>
+  mutate(department = factor(department, levels = dept_order_heat))
+```
+
+```{r heatmap-plot}
+ggplot(dept_normalised, aes(x = metric, y = department, fill = score_norm)) +
+  geom_tile(colour = "white", linewidth = 0.5) +
+  geom_text(aes(label = sprintf("%.2f", score_norm)),
+            size = 3, colour = "white", fontface = "bold") +
+  scale_fill_gradient(
+    low    = "#EF5350",
+    high   = "#26A69A",
+    name   = "Normalised\nscore (0–1)",
+    limits = c(0, 1)
+  ) +
+  scale_x_discrete(position = "top") +
+  labs(
+    title    = "Department Responsiveness Heatmap",
+    subtitle = "Metrics normalised 0–1 within each column · higher = better performance",
+    x        = NULL,
+    y        = NULL,
+    caption  = "Source: Oireachtas Open Data API via oiReachtas"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    axis.text.x      = element_text(face = "bold", size = 11),
+    panel.grid       = element_blank(),
+    plot.title       = element_text(face = "bold"),
+    legend.position  = "right"
+  )
+```
+
+---
+
+## 9  Extending to Written Questions via XML Parsing
+
+The same methodology extends naturally to **written questions**, which have a
+far larger volume (typically 10× more exchanges per week than oral questions).
+Written question answers are not directly returned as `text` fields by
+`get_debate_text()`; instead, the `formats_xml` column in `get_questions()`
+output contains a URI to a structured XML document.
+
+The general pattern for extracting written answer text from the XML is:
+
+```{r written-xml, eval=FALSE}
+# Written questions provide an XML URI in formats_xml
+written_qs <- get_questions(
+  chamber       = "dail",
+  date_start    = "2024-01-01",
+  date_end      = "2024-03-31",
+  question_type = "written",
+  limit         = 1000
+)
+
+# Helper: fetch and parse a single written-question XML document
+parse_written_xml <- function(xml_uri) {
+  if (is.na(xml_uri) || xml_uri == "") return(NULL)
+
+  tryCatch({
+    raw_xml <- xml2::read_xml(xml_uri)
+
+    # Written question XML structure (Oireachtas API):
+    #   <questionList>
+    #     <question questionId="..." questionType="written" date="...">
+    #       <questionText> ... </questionText>
+    #       <answer> ... </answer>
+    #     </question>
+    #   </questionList>
+
+    questions_nodes <- xml2::xml_find_all(raw_xml, ".//question")
+
+    purrr::map_dfr(questions_nodes, function(node) {
+      tibble::tibble(
+        question_id   = xml2::xml_attr(node, "questionId"),
+        question_type = xml2::xml_attr(node, "questionType"),
+        date          = xml2::xml_attr(node, "date"),
+        question_text = xml2::xml_text(
+          xml2::xml_find_first(node, ".//questionText")
+        ),
+        answer_text   = xml2::xml_text(
+          xml2::xml_find_first(node, ".//answer")
+        )
+      )
+    })
+  }, error = function(e) {
+    message(sprintf("Failed to parse XML at %s: %s", xml_uri, e$message))
+    NULL
+  })
+}
+
+# Map over all written question XML URIs
+written_parsed <- written_qs |>
+  dplyr::mutate(
+    parsed = purrr::map(formats_xml, parse_written_xml)
+  ) |>
+  dplyr::filter(!purrr::map_lgl(parsed, is.null)) |>
+  tidyr::unnest(parsed)
+
+# From here, apply the same cosine_sim() and flesch_kincaid() functions
+# defined earlier to written_parsed$question_text and
+# written_parsed$answer_text to build a written-question scorecard.
+#
+# Written questions also expose the `department` column directly from
+# get_questions(), so no regex extraction is needed.
+```
+
+> **Tip:** Written answers are frequently longer and more formulaic than oral
+> answers; you may find that readability scores cluster more tightly and that
+> deflection scores are systematically lower (ministers use boilerplate language
+> that shares little vocabulary with the specific question). Stratifying the
+> analysis by `question_type` ("oral" vs "written") before aggregating will
+> surface these structural differences clearly.
+
+---
+
+## Summary
+
+This vignette has demonstrated three complementary, fully reproducible measures
+of ministerial quality in oral question time:
+
+| Step | What we built |
+|---|---|
+| **4** | Violin plot of answer word counts by department (verbosity) |
+| **5** | Cosine similarity between question and answer TF-IDF vectors (deflection) |
+| **6** | Flesch-Kincaid reading ease computed from scratch in R (clarity) |
+| **7** | Bubble chart combining all three metrics per minister, coloured by party |
+| **8** | Department-level normalised heatmap for at-a-glance comparison |
+| **9** | Pattern for extending the same pipeline to written questions via XML |
+
+The three dimensions are intentionally independent: a minister can score well
+on verbosity but poorly on deflection (long answer, different topic), or well
+on readability but poorly on both others (clear but brief and off-topic). The
+combined scorecard in Section 7 is the most informative single view — ministers
+in the top-right quadrant (high cosine similarity, high readability) are both
+responsive and accessible, which is the democratic ideal for oral question time.
+
+```{r session-info, include=TRUE, eval=TRUE}
+sessionInfo()
+```
