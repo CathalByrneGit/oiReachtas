@@ -60,7 +60,7 @@ get_questions <- function(
     member_id     = member_id,
     question_id = question_id,
     question_no = question_no,
-    show_answers = show_answers,
+    show_answers = if (isTRUE(show_answers)) TRUE else NULL,
     question_type = question_type
   )
 

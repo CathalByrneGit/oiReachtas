@@ -34,6 +34,7 @@
     resp <- tryCatch(
       httr2::request(url)|>
         httr2::req_url_query(!!!params,.multi = "comma")|>
+        httr2::req_error(is_error = \(r) FALSE)|>   # handle HTTP errors manually below
         httr2::req_perform(),
       error = function(e) {
         if (attempt > max_retries) rlang::abort(
@@ -116,6 +117,7 @@
     resp <- tryCatch(
       httr2::request(url)|>
         httr2::req_user_agent("oiReachtas R package")|>
+        httr2::req_error(is_error = \(r) FALSE)|>   # handle HTTP errors manually below
         httr2::req_perform(),
       error = function(e) {
         if (attempt > max_retries) rlang::abort(
