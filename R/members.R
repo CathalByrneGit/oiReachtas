@@ -169,8 +169,12 @@ get_member_parties <- function(chamber = "", house_no = NULL, member_id = NULL, 
     purrr::map_df(m$memberships, function(mem_wrapper) {
       ms <- mem_wrapper$membership
       
-      # Extract constituency (representing)
-      const <- ms$represents[[1]]$represent$showAs %||% NA_character_
+      # Extract constituency (representing) — represents may be empty
+      const <- if (length(ms$represents) > 0L) {
+        ms$represents[[1]]$represent$showAs %||% NA_character_
+      } else {
+        NA_character_
+      }
       
       # Iterate through every party they belonged to during THIS membership
       purrr::map_df(ms$parties, function(p_wrapper) {
