@@ -30,6 +30,10 @@
   max_retries <- getOption("oiReachtas.max_retries", 4L)
   wait        <- getOption("oiReachtas.retry_wait",  1)   # seconds
 
+  # Build a readable query string for logging
+  qs <- paste(names(params), unlist(params), sep = "=", collapse = "&")
+  message(sprintf("[oiReachtas] GET %s?%s", endpoint, qs))
+
   for (attempt in seq_len(max_retries + 1L)) {
     resp <- tryCatch(
       httr2::request(url)|>
@@ -37,6 +41,8 @@
         httr2::req_error(is_error = \(r) FALSE)|>   # handle HTTP errors manually below
         httr2::req_perform(),
       error = function(e) {
+        message(sprintf("[oiReachtas] Connection failed (attempt %d): %s",
+                        attempt, conditionMessage(e)))
         if (attempt > max_retries) rlang::abort(
           paste0("Network error after ", max_retries, " retries: ", conditionMessage(e)),
           class = "oireachtas_network_error"
@@ -53,11 +59,20 @@
     }
 
     status <- httr2::resp_status(resp)
+    message(sprintf("[oiReachtas] HTTP %d %s", status, httr2::resp_status_desc(resp)))
 
     # Success
     if (status < 400L) {
       return(httr2::resp_body_json(resp))
     }
+
+    # Log response body on error to show what the API said
+    body_text <- tryCatch(
+      httr2::resp_body_string(resp),
+      error = function(e) "(unreadable body)"
+    )
+    message(sprintf("[oiReachtas] Error body: %s",
+                    substr(body_text, 1L, 500L)))
 
     # Retryable: 429 (rate limit) or transient 5xx
     retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
@@ -137,7 +152,7 @@
 
     retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
     if (retryable && attempt <= max_retries) {
-      retry_after <- suppressWarnings(as.numeric(httr2::resp_headers(resp)[['retry-after']]))
+      retry_after <- suppressWarnings(as.numeric(httr2::resp_header(resp, "retry-after")))
       sleep_for <- if (!is.na(retry_after) && retry_after > 0) retry_after else wait
       message(sprintf("[oiReachtas] HTTP %d – retrying XML fetch in %.0fs", status, sleep_for))
       Sys.sleep(sleep_for); wait <- wait * 2; next
@@ -220,19 +235,32 @@
 .oir_get_all <- function(endpoint, params = list(), limit = 50L, max_records = Inf) {
   results <- list()
   skip    <- 0L
+  page    <- 1L
 
   repeat {
+    message(sprintf("[oiReachtas] Fetching page %d (skip=%d, limit=%d)...",
+                    page, skip, limit))
+
     page_params <- c(params, .oir_pagination(limit = limit, skip = skip))
     resp  <- .oir_get(endpoint, page_params)
-    items <- tryCatch(resp$results, error = function(e) list())
+    items <- tryCatch(resp$results, error = function(e) {
+      message(sprintf("[oiReachtas] Could not extract $results from response. Names: %s",
+                      paste(names(resp), collapse = ", ")))
+      list()
+    })
     if (is.null(items)) items <- list()
 
+    n_page <- length(items)
     results <- c(results, items)
-    skip    <- skip + length(items)
+    skip    <- skip + n_page
+    message(sprintf("[oiReachtas] Page %d: %d items returned (total so far: %d)",
+                    page, n_page, length(results)))
+    page <- page + 1L
 
-    if (length(items) < limit || length(results) >= max_records) break
+    if (n_page < limit || length(results) >= max_records) break
   }
 
+  message(sprintf("[oiReachtas] Done – %d total items fetched.", length(results)))
   if (is.finite(max_records)) results <- results[seq_len(min(length(results), max_records))]
   results
 }
