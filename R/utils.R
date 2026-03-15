@@ -62,7 +62,7 @@
     retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
     if (retryable && attempt <= max_retries) {
       retry_after <- suppressWarnings(
-        as.numeric(httr2::resp_headers(resp)[['retry-after']])
+        as.numeric(httr2::resp_header(resp, "retry-after"))
       )
       sleep_for <- if (!is.na(retry_after) && retry_after > 0) retry_after else wait
       message(sprintf(
@@ -177,7 +177,7 @@
 
 #' @keywords internal
 .oir_check_response <- function(resp) {
-  if (httr2::req_error(resp)) {
+  if (httr2::resp_is_error(resp)) {
     status <- httr2::resp_status(resp)
     body <- tryCatch(
       httr2::resp_body_json(resp),
