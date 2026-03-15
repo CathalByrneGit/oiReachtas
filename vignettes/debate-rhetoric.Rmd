@@ -97,22 +97,23 @@ raw_debates <- get_debates(
 glimpse(raw_debates)
 #> Rows: 312
 #> Columns: 8
-#> $ debate_id       <chr> "2024-09-10.2", ...
-#> $ debate_type     <chr> "debate", ...
-#> $ chamber         <chr> "dail", ...
-#> $ date            <date> 2024-09-10, ...
-#> $ section_title   <chr> "Priority Questions", ...
-#> $ counts_speeches <int> 18, ...
-#> $ counts_questions<int> 6, ...
-#> $ formats_xml     <chr> "https://data.oireachtas.ie/...", ...
+#> $ debate_id           <chr> "/ie/oireachtas/debate/dail/2024-09-10/priorityquestions", ...
+#> $ debate_type         <chr> "debate", ...
+#> $ chamber             <chr> "Dáil Éireann", ...
+#> $ house_no            <chr> "33", ...
+#> $ date                <chr> "2024-09-10", ...
+#> $ counts_questions    <int> 6, ...
+#> $ counts_bill         <int> 0, ...
+#> $ counts_countributor <int> 18, ...
+#> $ formats_xml         <chr> "https://data.oireachtas.ie/...", ...
 ```
 
 Filter to the two session types of interest:
 
 ```{r filter-debates}
+# debate_id URIs contain slugs like "priorityquestions" / "taoisearchquestions"
 qt_debates <- raw_debates |>
-  filter(grepl("Priority Questions|Taoiseach.s Questions",
-               section_title, ignore.case = TRUE),
+  filter(grepl("priority|taoiseach", debate_id, ignore.case = TRUE),
          !is.na(formats_xml))
 
 nrow(qt_debates)
@@ -132,7 +133,7 @@ safe_text <- possibly(get_debate_text, otherwise = NULL)
 transcripts_raw <- qt_debates |>
   mutate(text_data = map(formats_xml,
                          \(u) safe_text(uri = u, by_para = TRUE))) |>
-  select(debate_id, date, section_title, text_data) |>
+  select(debate_id, date, text_data) |>
   unnest(text_data)
 
 # Persist to avoid re-downloading
@@ -154,11 +155,15 @@ speeches <- transcripts_raw |>
   filter(speech_type == "speech",
          !is.na(text), nchar(trimws(text)) > 0)
 
-members <- get_members(chamber = "dail", limit = 200)
+# get_member_parties() is the canonical source of party affiliation
+members <- get_member_parties(chamber = "dail", all_pages = TRUE) |>
+  group_by(member_id) |>
+  slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
+  ungroup() |>
+  select(member_id, party = party_code)
 
 speeches <- speeches |>
-  left_join(members |> select(member_pId, party),
-            by = c("speaker_ref" = "member_pId")) |>
+  left_join(members, by = c("speaker_ref" = "member_id")) |>
   mutate(party = coalesce(party, "Ind"),
          # Normalise minor parties to keep colour palette tidy
          party = case_when(
@@ -293,14 +298,14 @@ afinn <- get_sentiments("afinn")
 # Word-level tokens from paragraph text
 word_tokens <- speeches |>
   select(debate_id, speech_no, speaker_name, speaker_ref,
-         party, date, section_title, text) |>
+         party, date, section_heading, text) |>
   unnest_tokens(word, text)
 
 # Join sentiment scores
 speech_sentiment <- word_tokens |>
   inner_join(afinn, by = "word") |>
   group_by(debate_id, speech_no, speaker_name, speaker_ref,
-           party, date, section_title) |>
+           party, date, section_heading) |>
   summarise(mean_sent  = mean(value),
             sum_sent   = sum(value),
             n_sent_words = n(),
@@ -349,7 +354,7 @@ pick the longest Taoiseach's Questions session as a case study.
 
 ```{r pick-debate}
 biggest_debate <- speech_sentiment |>
-  filter(grepl("Taoiseach", section_title)) |>
+  filter(grepl("Taoiseach", section_heading)) |>
   count(debate_id, date) |>
   slice_max(n, n = 1)
 
@@ -435,12 +440,11 @@ sample_debates <- qt_debates |> slice_sample(n = 30)
 transcripts_speech <- sample_debates |>
   mutate(text_data = map(formats_xml,
                          \(u) safe_text(uri = u, by_para = FALSE))) |>
-  select(debate_id, date, section_title, text_data) |>
+  select(debate_id, date, section_heading, text_data) |>
   unnest(text_data) |>
   filter(speech_type == "speech",
          !is.na(text), nchar(trimws(text)) > 20) |>
-  left_join(members |> select(member_pId, party),
-            by = c("speaker_ref" = "member_pId")) |>
+  left_join(members, by = c("speaker_ref" = "member_id")) |>
   mutate(party = coalesce(party, "Ind"),
          party = if_else(party %in% names(party_colours), party, "Ind"))
 
@@ -529,11 +533,11 @@ extreme <- speech_sentiment |>
 
 top5_pos <- extreme |>
   slice_max(mean_sent, n = 5) |>
-  select(speaker_name, date, section_title, mean_sent, debate_id, speech_no)
+  select(speaker_name, date, section_heading, mean_sent, debate_id, speech_no)
 
 top5_neg <- extreme |>
   slice_min(mean_sent, n = 5) |>
-  select(speaker_name, date, section_title, mean_sent, debate_id, speech_no)
+  select(speaker_name, date, section_heading, mean_sent, debate_id, speech_no)
 
 cat("=== Five Most Positive Speeches ===\n")
 print(top5_pos, n = Inf)

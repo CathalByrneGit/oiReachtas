@@ -122,7 +122,6 @@ constituency) and compute electoral proximity.
 # ── written questions: Jan 2019 – Dec 2024 ──────────────────────────────────
 # Fetch in two blocks to stay within API page limits
 qs_2019_2021 <- get_questions(
-  chamber       = "dail",
   date_start    = "2019-01-01",
   date_end      = "2021-12-31",
   question_type = "written",
@@ -131,7 +130,6 @@ qs_2019_2021 <- get_questions(
 )
 
 qs_2022_2024 <- get_questions(
-  chamber       = "dail",
   date_start    = "2022-01-01",
   date_end      = "2024-12-31",
   question_type = "written",
@@ -141,9 +139,18 @@ qs_2022_2024 <- get_questions(
 
 qs_raw <- bind_rows(qs_2019_2021, qs_2022_2024)
 
-# ── member roster ────────────────────────────────────────────────────────────
-members <- get_members(chamber = "dail", limit = 300) |>
-  select(member_name, party = party_code, constituency)
+# ── member roster: biographical + party/constituency ────────────────────────
+members <- get_members(chamber = "dail", all_pages = TRUE) |>
+  select(member_id = member_code, member_name = full_name) |>
+  left_join(
+    get_member_parties(chamber = "dail", all_pages = TRUE) |>
+      group_by(member_id) |>
+      slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
+      ungroup() |>
+      select(member_id, party = party_code, constituency),
+    by = "member_id"
+  ) |>
+  select(member_name, party, constituency)
 
 # ── join and compute electoral proximity ────────────────────────────────────
 qs <- qs_raw |>

@@ -119,7 +119,7 @@ fetch_safe <- possibly(
 )
 
 transcripts_raw <- oral_debates |>
-  select(debate_id, date, section_title, formats_xml) |>
+  select(debate_id, date, formats_xml) |>
   mutate(
     transcript = map(formats_xml, fetch_safe)
   ) |>
@@ -495,11 +495,20 @@ minister_scorecard <- qa_pairs |>
   filter(n_exchanges >= 5)
 
 # ── Attach party from member roster ──────────────────────────────────────────
-members <- get_members(chamber = "dail", limit = 200) |>
+members <- get_members(chamber = "dail", all_pages = TRUE) |>
+  select(member_id = member_code, member_name = full_name) |>
+  left_join(
+    get_member_parties(chamber = "dail", all_pages = TRUE) |>
+      group_by(member_id) |>
+      slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
+      ungroup() |>
+      select(member_id, party = party_code),
+    by = "member_id"
+  ) |>
   select(member_name, party)
 
 minister_scorecard <- minister_scorecard |>
-  left_join(members, by = "minister_name") |>
+  left_join(members, by = c("minister_name" = "member_name")) |>
   mutate(party = coalesce(party, "Ind"))
 
 # Map party codes to the canonical short forms used in party_colours
@@ -665,7 +674,6 @@ The general pattern for extracting written answer text from the XML is:
 ```{r written-xml, eval=FALSE}
 # Written questions provide an XML URI in formats_xml
 written_qs <- get_questions(
-  chamber       = "dail",
   date_start    = "2024-01-01",
   date_end      = "2024-03-31",
   question_type = "written",

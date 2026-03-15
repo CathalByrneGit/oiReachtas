@@ -58,7 +58,6 @@ are preferred over oral ones for volume: there are roughly 10× more.
 
 ```{r fetch}
 qs_raw <- get_questions(
-  chamber       = "dail",
   question_type = "written",
   date_start    = "2023-01-01",
   date_end      = "2023-12-31",

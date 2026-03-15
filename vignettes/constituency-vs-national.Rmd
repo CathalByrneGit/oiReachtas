@@ -135,7 +135,6 @@ date_end   <- Sys.Date()
 date_start <- date_end - 365
 
 questions_raw <- get_questions(
-  chamber       = "dail",
   date_start    = format(date_start, "%Y-%m-%d"),
   date_end      = format(date_end,   "%Y-%m-%d"),
   question_type = "written",
@@ -150,10 +149,17 @@ cat("Total written questions retrieved:", nrow(questions_raw), "\n")
 ### 3.2  Member Metadata
 
 ```{r fetch-members}
-members_raw <- get_members(
-  chamber = "dail",
-  limit   = 200
-)
+# get_members() returns biographical data; get_member_parties() gives party/constituency
+members_raw <- get_members(chamber = "dail", all_pages = TRUE) |>
+  select(member_id = member_code, member_name = full_name) |>
+  left_join(
+    get_member_parties(chamber = "dail", all_pages = TRUE) |>
+      group_by(member_id) |>
+      slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
+      ungroup() |>
+      select(member_id, party = party_code, party_name, constituency),
+    by = "member_id"
+  )
 
 glimpse(members_raw)
 ```
@@ -194,19 +200,19 @@ questions_classified %>%
 
 ```{r join-members}
 members_clean <- members_raw %>%
-  select(member_pId, member_name, party, constituency) %>%
+  select(member_name, party, party_name, constituency) %>%
   # Abbreviate party labels to match colour palette
   mutate(
     party_abbr = case_when(
-      str_detect(tolower(party), "fianna")        ~ "FF",
-      str_detect(tolower(party), "fine gael")     ~ "FG",
-      str_detect(tolower(party), "sinn")          ~ "SF",
-      str_detect(tolower(party), "labour")        ~ "Lab",
-      str_detect(tolower(party), "green")         ~ "GP",
-      str_detect(tolower(party), "social dem")    ~ "SD",
-      str_detect(tolower(party), "people before") ~ "PBP",
-      str_detect(tolower(party), "solidarity")    ~ "PBP",
-      TRUE                                        ~ "Ind"
+      str_detect(tolower(party_name), "fianna")        ~ "FF",
+      str_detect(tolower(party_name), "fine gael")     ~ "FG",
+      str_detect(tolower(party_name), "sinn")          ~ "SF",
+      str_detect(tolower(party_name), "labour")        ~ "Lab",
+      str_detect(tolower(party_name), "green")         ~ "GP",
+      str_detect(tolower(party_name), "social dem")    ~ "SD",
+      str_detect(tolower(party_name), "people before") ~ "PBP",
+      str_detect(tolower(party_name), "solidarity")    ~ "PBP",
+      TRUE                                             ~ "Ind"
     )
   )
 

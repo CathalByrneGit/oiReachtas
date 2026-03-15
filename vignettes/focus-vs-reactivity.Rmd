@@ -83,9 +83,19 @@ library(tidytext)
 ## 2  Data
 
 ```{r fetch}
-# ── Member roster ─────────────────────────────────────────────────────────
-members <- get_members(house = "dail", limit = 200) |>
-  select(member_id = member_pId, member_name, party, constituency)
+# ── Member roster: biographical + party/constituency ──────────────────────
+members_core <- get_members(chamber = "dail", all_pages = TRUE) |>
+  select(member_id = member_code, member_name = full_name)
+
+members_parties <- get_member_parties(chamber = "dail", all_pages = TRUE) |>
+  group_by(member_id) |>
+  slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
+  ungroup() |>
+  select(member_id, party = party_code, constituency)
+
+members <- members_core |>
+  left_join(members_parties, by = "member_id") |>
+  select(member_name, party, constituency)
 
 # ── Two years of written questions (more time = better consistency signal) ─
 qs_raw <- get_questions(
@@ -96,8 +106,8 @@ qs_raw <- get_questions(
 )
 
 qs <- qs_raw |>
-  select(member_pId, show_as, dept_name, date) |>
-  left_join(members, by = c("member_pId" = "member_id")) |>
+  select(member_name, show_as, department, date) |>
+  left_join(members, by = "member_name") |>
   filter(!is.na(member_name), !is.na(show_as), nchar(show_as) > 5) |>
   mutate(
     date    = as.Date(date),
@@ -309,7 +319,7 @@ to is a coarse but intuitive measure of spread.  Specialists interrogate
 dept_diversity <- qs |>
   group_by(member_name) |>
   summarise(
-    n_depts        = n_distinct(dept_name, na.rm = TRUE),
+    n_depts        = n_distinct(department, na.rm = TRUE),
     n_qs           = n(),
     depts_per_100q = n_depts / n_qs * 100,
     .groups        = "drop"

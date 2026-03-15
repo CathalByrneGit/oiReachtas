@@ -283,10 +283,10 @@ bill_debates <- get_debates(
   date_end   = "2023-06-30"
 )
 
-# The division subject field often contains the bill short title
+# debate_id URIs contain a slug of the section title; filter on that
 bill_debates |>
-  filter(grepl("Health.*Miscellaneous", section_title, ignore.case = TRUE)) |>
-  select(date, section_title, formats_xml) |>
+  filter(grepl("health.*miscellaneous", debate_id, ignore.case = TRUE)) |>
+  select(date, debate_id, formats_xml) |>
   head(5)
 ```
 
@@ -464,8 +464,9 @@ related <- get_debates(
 )
 
 bill_kw <- gsub("\\(.*\\)", "", target$title) |> trimws()   # strip parenthetical
+# debate_id URIs contain a slug of the debate section title
 bill_debates <- related |>
-  filter(grepl(bill_kw, section_title, ignore.case = TRUE))
+  filter(grepl(bill_kw, debate_id, ignore.case = TRUE))
 
 cat("Debate sections found:", nrow(bill_debates), "\n")
 
