@@ -32,10 +32,9 @@
 
   for (attempt in seq_len(max_retries + 1L)) {
     resp <- tryCatch(
-      httr::GET(url,
-                query  = params,
-                httr::user_agent(ua),
-                httr::accept_json()),
+      httr2::request(url)|>
+        httr2::req_url_query(!!!params,.multi = "comma")|>
+        httr2::req_perform(),
       error = function(e) {
         if (attempt > max_retries) rlang::abort(
           paste0("Network error after ", max_retries, " retries: ", conditionMessage(e)),
@@ -52,21 +51,18 @@
       next
     }
 
-    status <- httr::status_code(resp)
+    status <- httr2::resp_status(resp)
 
     # Success
     if (status < 400L) {
-      return(jsonlite::fromJSON(
-        httr::content(resp, as = "text", encoding = "UTF-8"),
-        simplifyVector = FALSE
-      ))
+      return(httr2::resp_body_json(resp))
     }
 
     # Retryable: 429 (rate limit) or transient 5xx
     retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
     if (retryable && attempt <= max_retries) {
       retry_after <- suppressWarnings(
-        as.numeric(httr::headers(resp)[["retry-after"]])
+        as.numeric(httr2::resp_headers(resp)[['retry-after']])
       )
       sleep_for <- if (!is.na(retry_after) && retry_after > 0) retry_after else wait
       message(sprintf(
@@ -118,8 +114,9 @@
 
   for (attempt in seq_len(max_retries + 1L)) {
     resp <- tryCatch(
-      httr::GET(url, httr::user_agent("oiReachtas R package"),
-                httr::accept("application/xml")),
+      httr2::request(url)|>
+        httr2::req_user_agent("oiReachtas R package")|>
+        httr2::req_perform(),
       error = function(e) {
         if (attempt > max_retries) rlang::abort(
           paste0("Network error fetching XML: ", conditionMessage(e)),
@@ -133,12 +130,12 @@
       .oir_backoff(attempt, wait); wait <- wait * 2; next
     }
 
-    status <- httr::status_code(resp)
-    if (status < 400L) return(xml2::read_xml(httr::content(resp, as = "raw")))
+    status <- httr2::resp_status(resp)
+    if (status < 400L) return(xml2::read_xml(httr2::resp_body_raw(resp)))
 
     retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
     if (retryable && attempt <= max_retries) {
-      retry_after <- suppressWarnings(as.numeric(httr::headers(resp)[["retry-after"]]))
+      retry_after <- suppressWarnings(as.numeric(httr2::resp_headers(resp)[['retry-after']]))
       sleep_for <- if (!is.na(retry_after) && retry_after > 0) retry_after else wait
       message(sprintf("[oiReachtas] HTTP %d – retrying XML fetch in %.0fs", status, sleep_for))
       Sys.sleep(sleep_for); wait <- wait * 2; next
@@ -164,7 +161,7 @@
   cache <- if (max_age > 0) {
     cachem::cache_mem(max_age = max_age)
   } else {
-    cachem::cache_null()
+    NULL
   }
 
   # Assign into the package namespace so other functions can reach it
@@ -180,13 +177,13 @@
 
 #' @keywords internal
 .oir_check_response <- function(resp) {
-  if (httr::http_error(resp)) {
-    status <- httr::status_code(resp)
+  if (httr2::req_error(resp)) {
+    status <- httr2::resp_status(resp)
     body <- tryCatch(
-      jsonlite::fromJSON(httr::content(resp, as = "text", encoding = "UTF-8")),
-      error = function(e) list(message = httr::http_status(resp)$message)
+      httr2::resp_body_json(resp),
+      error = function(e) list(message = httr2::resp_status_desc(resp))
     )
-    msg <- body$message %||% httr::http_status(resp)$message
+    msg <- body$message %||% httr2::resp_status_desc(resp)
     rlang::abort(
       paste0("Oireachtas API error [HTTP ", status, "]: ", msg),
       class = "oireachtas_api_error",
@@ -225,7 +222,7 @@
   repeat {
     page_params <- c(params, .oir_pagination(limit = limit, skip = skip))
     resp  <- .oir_get(endpoint, page_params)
-    items <- tryCatch(resp$results$items, error = function(e) list())
+    items <- tryCatch(resp$results, error = function(e) list())
     if (is.null(items)) items <- list()
 
     results <- c(results, items)

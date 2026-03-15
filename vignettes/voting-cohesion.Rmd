@@ -68,10 +68,15 @@ We use one full calendar year (2023) to keep the initial download manageable.
 The same code works for the full 33rd Dáil by removing the date filters.
 
 ```{r fetch-divisions}
+
+start_date_i <- "2024-01-01"
+
+end_date_i <- "2024-12-31"
+
 divs <- get_divisions(
   chamber    = "dail",
-  date_start = "2023-01-01",
-  date_end   = "2023-12-31",
+  date_start = "2024-01-01",
+  date_end   = "2024-12-31",
   all_pages  = TRUE
 )
 
@@ -80,7 +85,7 @@ nrow(divs)
 
 # Divisions with almost no contest (lopsided >95 %) add noise — keep them anyway
 divs |>
-  select(date, division_no, subject, count_ta, count_nil) |>
+  select(date, division_id, subject, count_ta, count_nil) |>
   slice_head(n = 5)
 #> # A tibble: 5 × 5
 #>   date       division_no subject                           count_ta count_nil
@@ -103,17 +108,20 @@ votes_file <- "dail_votes_2023.rds"
 if (file.exists(votes_file)) {
   all_votes <- readRDS(votes_file)
 } else {
-  all_votes <- map_dfr(
-    divs$division_id,
-    ~ tryCatch(
-        get_division_votes(.x),
-        error = function(e) {
-          message("Skipping ", .x, ": ", conditionMessage(e))
-          tibble()
-        }
-      ),
-    .progress = TRUE
-  )
+  all_votes <- divs|>
+  select(division_id, date, member_id_ta, members_id_nil, members_id_staon) |>
+  # 1. Turn the three columns into two: 'vote_type' and 'member_ids'
+  tidyr::pivot_longer(
+    cols = starts_with("member"), 
+    names_to = "vote_type", 
+    values_to = "member_id"
+  ) |>
+  # 2. Now separate. Since it's one column, different counts don't matter.
+  tidyr::separate_longer_delim(member_id, delim = ";") |>
+  # 3. Clean up the vote_type names (optional)
+  mutate(vote_type = sub("members?_id_", "", vote_type)) |>
+  # 4. Remove any empty rows (if a vote type had no members)
+  filter(!is.na(member_id) & member_id != "")
   saveRDS(all_votes, votes_file)
 }
 
@@ -138,15 +146,21 @@ and pivot to a wide member × division matrix. Absence (not in the roll) is
 ```{r vote-matrix}
 vote_num <- all_votes |>
   mutate(vote_val = case_when(
-    vote == "ta"    ~  1L,
-    vote == "nil"   ~ -1L,
-    vote == "staon" ~  0L,
+    vote_type == "ta"    ~  1L,
+    vote_type == "nil"   ~ -1L,
+    vote_type == "staon" ~  0L,
     .default        =  NA_integer_
   )) |>
   filter(!is.na(vote_val))
 
-vote_wide <- vote_num |>
-  select(member_name, division_id, vote_val) |>
+vote_num_remove_duplicates <- vote_num|>
+  group_by(member_id,division_id)|>
+  filter(row_number()==1)
+  
+  
+vote_wide <- vote_num_remove_duplicates |>
+  transmute(member_name = gsub("\\.(.*)",'',member_id)|>
+              gsub('-',' ',x = _), division_id, vote_val) |>
   pivot_wider(
     id_cols     = member_name,
     names_from  = division_id,
@@ -204,9 +218,10 @@ compute_agreement <- function(mat, min_shared = 30L) {
 
 agree_mat <- compute_agreement(mat)
 
+random_cohort <- sample(agree_mat|>row.names(),3)
 # Peek at a few familiar names
-agree_mat[c("Micheál Martin", "Leo Varadkar", "Mary Lou McDonald"),
-          c("Micheál Martin", "Leo Varadkar", "Mary Lou McDonald")] |>
+agree_mat[random_cohort,
+          random_cohort] |>
   round(3)
 #>                   Micheál Martin Leo Varadkar Mary Lou McDonald
 #> Micheál Martin             1.000        0.941             0.231
@@ -224,7 +239,16 @@ Ward's linkage, which minimises within-cluster variance.
 ```{r cluster}
 dist_mat <- as.dist(1 - agree_mat, diag = TRUE)
 
+dist_mat[is.na(dist_mat)] <- 0.5
+
+
 hc <- hclust(dist_mat, method = "ward.D2")
+
+
+# Cut into 3 clusters to separate them into Government, Opposition, and a third 'Independent/Mixed' group?
+k       <- 3L
+clusters <- cutree(hc, k = k)
+
 
 # Cut into 4 clusters reflecting the 33rd Dáil's broad political blocs
 k       <- 4L
@@ -314,10 +338,28 @@ Aggregating to party level makes the bloc structure immediately clear.
 
 ```{r party-agree}
 # Attach party labels from get_members()
-members_meta <- get_members(chamber = "dail", house_no = 33,
-                            all_pages = TRUE) |>
-  select(full_name, party_name) |>
-  distinct()
+
+member_ids <- vote_num$member_id|>unique()
+
+party_details <- lapply(member_ids,\(x) get_member_parties(member_id = x))|>
+  do.call(what= rbind)
+
+current_party <- party_details|>
+  mutate(start_date = as.Date(start_date),
+         end_date = as.Date(end_date),
+         end_date = replace_na(end_date,Sys.Date()),
+         member_name = gsub("\\.(.*)",'',member_id)|>
+              gsub('-',' ',x = _)
+         )|>
+  filter(is.na(end_date)|end_date>start_date_i)%>%
+  group_by(member_id)|>
+  arrange(desc(end_date))|>
+  filter(row_number() == 1)|>
+  ungroup()
+
+members_meta  <- current_party|>
+  transmute(full_name = member_name,
+            party_name = party_name)
 
 # Add cluster and party to each member
 member_meta <- tibble::tibble(
@@ -364,7 +406,7 @@ ggplot(party_agree, aes(x = party_b, y = party_a, fill = mean_agreement)) +
   ) +
   scale_x_discrete(guide = guide_axis(angle = 40)) +
   labs(
-    title    = "Inter- and Intra-Party Vote Agreement (2023)",
+    title    = "Inter- and Intra-Party Vote Agreement (2024)",
     subtitle = "Diagonal = internal cohesion. Sorted by cohesion (highest first).",
     x        = NULL,
     y        = NULL
@@ -387,8 +429,17 @@ party was evenly split. We average across divisions to get each party's
 overall cohesion score.
 
 ```{r rice}
+
+
+
+
 # Attach party to individual votes
-votes_party <- all_votes |>
+votes_party <- vote_num_remove_duplicates |>
+  ungroup()|>
+  transmute(member_name = gsub("\\.(.*)",'',member_id)|>
+              gsub('-',' ',x = _),
+         vote = vote_type,
+         division_id)|>
   left_join(members_meta, by = c("member_name" = "full_name")) |>
   filter(!is.na(party_name), vote %in% c("ta", "nil"))
 
@@ -531,6 +582,8 @@ rebel_rate |>
   filter(party_name != "Independent") |>
   group_by(party_name) |>
   slice_max(rate, n = 3) |>
+  arrange(desc(rate))|>
+  filter(row_number() <=3)|>
   ungroup() |>
   mutate(
     member_name = reorder(member_name, rate),
@@ -572,8 +625,7 @@ pca <- prcomp(mat_imputed, scale. = FALSE)
 
 pca_df <- as.data.frame(pca$x[, 1:2]) |>
   tibble::rownames_to_column("member_name") |>
-  left_join(member_meta, by = "member_name") |>
-  left_join(members_meta, by = c("member_name" = "full_name"))
+  left_join(member_meta, by = "member_name")
 
 # Variance explained
 var_exp <- summary(pca)$importance[2, 1:2] * 100

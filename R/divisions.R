@@ -30,10 +30,14 @@
 #' }
 get_divisions <- function(chamber = "",
                           house_no = NULL,
+                          chamber_type = NULL,
                           chamber_id = NULL,
                           date_start = NULL,
                           date_end = NULL,
                           member_id = NULL,
+                          debate_id = NULL,
+                          vote_id = NULL,
+                          outcome = NULL,# Carried Lost
                           limit = 50L,
                           skip = 0L,
                           all_pages = FALSE) {
@@ -46,14 +50,17 @@ get_divisions <- function(chamber = "",
     chamber_id = chamber_id,
     date_start = date_start,
     date_end   = date_end,
-    member_id  = member_id
+    member_id  = member_id,
+    outcome = outcome,
+    vote_id = vote_id,
+    debate_id =debate_id
   )
 
   if (all_pages) {
     items <- .oir_get_all("/divisions", params, limit = limit)
   } else {
     resp  <- .oir_get("/divisions", c(params, .oir_pagination(limit, skip)))
-    items <- resp$results$items %||% list()
+    items <- resp$results %||% list()
   }
 
   .parse_divisions(items)
@@ -63,64 +70,50 @@ get_divisions <- function(chamber = "",
 .parse_divisions <- function(items) {
   if (length(items) == 0) return(tibble::tibble())
 
+  
+  
+  
+  
   rows <- purrr::map(items, function(item) {
-    d <- item$division %||% item
+    
+    
+    d <- item$division
+
+    members_id_ta <- sapply(d$tallies$taVotes$members,
+                            \(x) x$member$memberCode %||% NA_character_)|>
+      paste(collapse = ';')
+    
+    members_id_nil <- sapply(d$tallies$nilVotes$members,
+                             \(x) x$member$memberCode %||% NA_character_)|>
+      paste(collapse = ';')
+    
+    members_id_staon <- sapply(d$tallies$staonVotes$members,
+                               \(x) x$member$memberCode %||% NA_character_)|>
+      paste(collapse = ';')
+    
     tibble::tibble(
       division_id     = .null_na(d$uri),
       date            = .null_na(d$date),
-      chamber         = .null_na(d$house$showAs %||% NA_character_),
+      outcome = .null_na(d$outcome),
+      is_bill = d$isBill,
+      title = .null_na(d$debate$showAs%||% NA_character_),
+      chamber         = .null_na(d$chamber$showAs %||% NA_character_),
       house_no        = .null_na(d$house$houseNo %||% NA_character_),
-      division_no     = .null_na(d$divisionNo),
-      subject         = .null_na(d$subject$showAs %||% NA_character_),
-      count_ta        = .null_na(d$tallies$ta %||% NA_integer_),
-      count_nil       = .null_na(d$tallies$nil %||% NA_integer_),
-      count_staon     = .null_na(d$tallies$staon %||% NA_integer_)
+      vote_id        = .null_na(d$voteId %||% NA_character_),
+      category = .null_na(d$category %||% NA_character_),
+      subject = .null_na(d$subject$showAs %||% NA_character_),
+      debate_title = .null_na(d$debate$showAs %||% NA_character_),
+      debate_xml = .null_na(d$debate$formats$xml$uri %||% NA_character_),
+      committeeCode   = .null_na(d$house$committeeCode %||% NA_character_),
+      count_ta        = .null_na(d$tallies$taVotes$tally %||% NA_integer_),
+      count_nil       = .null_na(d$tallies$nilVotes$tally %||% NA_integer_),
+      count_staon     = .null_na(d$tallies$staonVotes$tally %||% NA_integer_),
+      member_id_ta   = .null_na(members_id_ta %||% NA_character_),
+      members_id_nil = .null_na(members_id_nil %||% NA_character_),
+      members_id_staon = .null_na(members_id_staon %||% NA_character_)
     )
   })
 
   dplyr::bind_rows(rows)
 }
 
-#' Retrieve Voting Record for a Specific Division
-#'
-#' Returns how each member voted in a given division.
-#'
-#' @param division_id Character. Division URI (from `get_divisions()$division_id`).
-#'
-#' @return A [tibble][tibble::tibble] with one row per member vote.
-#' @export
-#'
-#' @examples
-#' \dontrun{
-#' divs <- get_divisions(chamber = "dail", date_start = "2023-06-01",
-#'                       date_end = "2023-06-01")
-#' get_division_votes(divs$division_id[1])
-#' }
-get_division_votes <- function(division_id) {
-  resp  <- .oir_get("/divisions", list(division_id = division_id, limit = 1L))
-  items <- resp$results$items %||% list()
-  if (length(items) == 0) return(tibble::tibble())
-
-  d <- items[[1]]$division %||% items[[1]]
-
-  # Expand individual votes
-  vote_sections <- list(
-    ta    = d$votes$ta %||% list(),
-    nil   = d$votes$nil %||% list(),
-    staon = d$votes$staon %||% list()
-  )
-
-  rows <- purrr::imap(vote_sections, function(voters, vote_type) {
-    purrr::map(voters, function(v) {
-      tibble::tibble(
-        division_id  = .null_na(d$uri),
-        date         = .null_na(d$date),
-        member_uri   = .null_na(v$member$uri %||% NA_character_),
-        member_name  = .null_na(v$member$showAs %||% NA_character_),
-        vote         = vote_type
-      )
-    })
-  }) |> unlist(recursive = FALSE)
-
-  dplyr::bind_rows(rows)
-}

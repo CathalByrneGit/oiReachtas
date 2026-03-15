@@ -3,9 +3,6 @@
 #' Returns parliamentary questions (oral or written) submitted in the Dáil or
 #' Seanad, filtered by the given criteria.
 #'
-#' @param chamber Character. `"dail"`, `"seanad"`, or `""`. Default `"dail"`.
-#' @param house_no Integer or NULL. Specific house number. Default `NULL`.
-#' @param chamber_id Character or NULL. Full chamber URI. Default `NULL`.
 #' @param date_start Character or NULL. Start date (`"YYYY-MM-DD"`).
 #'   Default `NULL`.
 #' @param date_end Character or NULL. End date (`"YYYY-MM-DD"`).
@@ -31,13 +28,14 @@
 #' get_questions(member_id = "/ie/oireachtas/member/id/MaryLou.McDonald.D.2002-05-17",
 #'               question_type = "oral")
 #' }
-get_questions <- function(chamber = "dail",
-                          house_no = NULL,
-                          chamber_id = NULL,
+get_questions <- function(
                           date_start = NULL,
                           date_end = NULL,
                           member_id = NULL,
                           question_type = NULL,
+                          question_id = NULL,
+                          question_no = NULL,
+                          show_answers = FALSE,
                           limit = 50L,
                           skip = 0L,
                           all_pages = FALSE) {
@@ -48,14 +46,21 @@ get_questions <- function(chamber = "dail",
     rlang::abort("`question_type` must be 'oral', 'written', or NULL",
                  class = "oireachtas_invalid_param")
   }
+  
+  if(!is.null(member_id) && !grepl('/ie/oireachtas/member/id',member_id)){
+    
+    
+    member_id <- file.path('/ie/oireachtas/member/id',member_id)
+  }
+  
 
   params <- list(
-    chamber       = if (nchar(chamber) > 0) chamber else NULL,
-    house_no      = house_no,
-    chamber_id    = chamber_id,
     date_start    = date_start,
     date_end      = date_end,
     member_id     = member_id,
+    question_id = question_id,
+    question_no = question_no,
+    show_answers = show_answers,
     question_type = question_type
   )
 
@@ -63,7 +68,7 @@ get_questions <- function(chamber = "dail",
     items <- .oir_get_all("/questions", params, limit = limit)
   } else {
     resp  <- .oir_get("/questions", c(params, .oir_pagination(limit, skip)))
-    items <- resp$results$items %||% list()
+    items <- resp$results %||% list()
   }
 
   .parse_questions(items)
@@ -74,19 +79,20 @@ get_questions <- function(chamber = "dail",
   if (length(items) == 0) return(tibble::tibble())
 
   rows <- purrr::map(items, function(item) {
+    
     q <- item$question %||% item
+
     tibble::tibble(
       question_id   = .null_na(q$questionURI %||% q$uri),
       question_type = .null_na(q$questionType),
-      question_no   = .null_na(q$questionNo),
+      question_no   = .null_na(q$questionNumber),
+      answer    = .null_na(q$answerText),
       date          = .null_na(q$date),
-      member_uri    = .null_na(q$askedBy[[1]]$showAs %||% NA_character_),
-      member_name   = .null_na(q$askedBy[[1]]$showAs %||% NA_character_),
-      department    = .null_na(q$to[[1]]$showAs %||% NA_character_),
+      member_uri    = .null_na(q$by$showAs %||% NA_character_),
+      member_name   = .null_na(q$by$showAs %||% NA_character_),
+      department    = .null_na(q$to$showAs %||% NA_character_),
       show_as       = .null_na(q$showAs),
-      formats_xml   = .null_na(
-        purrr::map_chr(q$formats %||% list(), ~ .x$uri %||% NA_character_)[1]
-      )
+      formats_xml   = .null_na(q$debateSection$formats$xml%||% NA_character_) 
     )
   })
 

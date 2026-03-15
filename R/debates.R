@@ -31,33 +31,37 @@
 #' get_debates(member_id = "/ie/oireachtas/member/id/MicheálMartin.D.1989-07-12")
 #' }
 get_debates <- function(chamber = "",
-                        house_no = NULL,
                         chamber_id = NULL,
-                        date_start = NULL,
-                        date_end = NULL,
+                        chamber_type = NULL,
                         member_id = NULL,
                         debate_id = NULL,
+                        date_start = NULL,
+                        date_end = NULL,
                         limit = 50L,
                         skip = 0L,
                         all_pages = FALSE) {
+  
   .oir_validate_date(date_start, "date_start")
   .oir_validate_date(date_end, "date_end")
-
+  
   params <- list(
     chamber    = if (nchar(chamber) > 0) chamber else NULL,
-    house_no   = house_no,
+    chamber_type = chamber_type,
     chamber_id = chamber_id,
+    member_id = member_id,
+    debate_id = debate_id,
+    date_end =date_end,
     date_start = date_start,
-    date_end   = date_end,
-    member_id  = member_id,
-    debate_id  = debate_id
+    debate_id =debate_id
   )
+  
+
 
   if (all_pages) {
     items <- .oir_get_all("/debates", params, limit = limit)
   } else {
     resp  <- .oir_get("/debates", c(params, .oir_pagination(limit, skip)))
-    items <- resp$results$items %||% list()
+    items <- resp$results %||% list()
   }
 
   .parse_debates(items)
@@ -95,19 +99,23 @@ get_debate_record <- function(debate_id, date = NULL) {
   if (length(items) == 0) return(tibble::tibble())
 
   rows <- purrr::map(items, function(item) {
+    
     d <- item$debateRecord %||% item
+    
+
     tibble::tibble(
       debate_id        = .null_na(d$uri),
       debate_type      = .null_na(d$debateType),
       chamber          = .null_na(d$chamber$showAs %||% d$house$showAs %||% NA_character_),
       house_no         = .null_na(d$house$houseNo %||% NA_character_),
+      committee_code = .null_na(d$house$comitteeCode %||% NA_character_),
       date             = .null_na(d$date),
-      section_title    = .null_na(d$showAs),
-      counts_speeches  = .null_na(d$counts$speeches %||% NA_integer_),
-      counts_questions = .null_na(d$counts$questions %||% NA_integer_),
-      formats_xml      = .null_na(
-        purrr::map_chr(d$formats %||% list(), ~ .x$uri %||% NA_character_)[1]
-      )
+      counts_questions = .null_na(d$counts$questionCount %||% NA_integer_),
+      counts_bill = .null_na(d$counts$billCount %||% NA_integer_),
+      counts_countributor = .null_na(d$counts$contributorCount %||% NA_integer_),
+      
+      formats_xml      = .null_na(d$formats$xml$uri %||% NA_character_)
+      
     )
   })
 

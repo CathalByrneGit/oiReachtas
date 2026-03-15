@@ -68,7 +68,7 @@ period. We fetch the complete set — the session cache means subsequent calls
 are instant.
 
 ```{r fetch-all}
-legs_33 <- get_legislation(house_no = 33, all_pages = TRUE)
+legs_33 <- get_legislation(chamber = '32',all_pages = TRUE)
 
 glimpse(legs_33)
 #> Rows: 412
@@ -137,9 +137,9 @@ ggplot(status_counts, aes(x = n_bills, y = bill_status, fill = bill_status)) +
 
 ```{r bill-type-status}
 type_status <- legs_33 |>
-  filter(!is.na(bill_type)) |>
-  count(bill_type, bill_status) |>
-  group_by(bill_type) |>
+  filter(!is.na(bill_source)) |>
+  count(bill_source, bill_status) |>
+  group_by(bill_source) |>
   mutate(pct = n / sum(n) * 100) |>
   ungroup()
 ```
@@ -154,7 +154,7 @@ outcome_palette <- c(
 )
 
 ggplot(type_status,
-       aes(x = pct, y = bill_type, fill = bill_status)) +
+       aes(x = pct, y = bill_source, fill = bill_status)) +
   geom_col(position = "stack", width = 0.5) +
   scale_fill_manual(values = outcome_palette, name = "Status") +
   scale_x_continuous(labels = function(x) paste0(x, "%"),
@@ -222,17 +222,18 @@ ggplot(enacted, aes(x = years_to_enact, fill = bill_type)) +
 
 ```{r top-sponsors}
 top_sponsors <- legs_33 |>
-  filter(!is.na(sponsor_name)) |>
-  count(sponsor_name, bill_type, name = "n_bills") |>
+  filter(!is.na(sponsors_name)) |>
+  separate_longer_delim(sponsors_name,';')|>
+  count(sponsors_name, bill_source, name = "n_bills") |>
   # Exclude generic government entries; keep individual names
-  filter(!grepl("^Minister|^Government", sponsor_name)) |>
+  filter(!grepl("^Minister|^Government", sponsors_name)) |>
   slice_max(n_bills, n = 15) |>
-  mutate(sponsor_name = reorder(sponsor_name, n_bills))
+  mutate(sponsors_name = reorder(sponsors_name, n_bills))
 ```
 
 ```{r plot-sponsors, fig.width=7, fig.height=6}
 ggplot(top_sponsors,
-       aes(x = n_bills, y = sponsor_name, fill = bill_type)) +
+       aes(x = n_bills, y = sponsors_name, fill = bill_source)) +
   geom_col(width = 0.65) +
   scale_fill_manual(
     values = c("Government" = "#457b9d", "Private Members'" = "#e9c46a"),
@@ -257,7 +258,7 @@ ggplot(top_sponsors,
 # The Health (Miscellaneous Provisions) Bill 2022
 hmp <- get_legislation(bill_no = 65, bill_year = 2022)
 
-hmp |> select(title, bill_type, bill_status, sponsor_name,
+hmp |> select(title, bill_type, bill_status, sponsors_name,
               date_introduced, act_no, act_year)
 #> # A tibble: 1 × 7
 #>   title                           bill_type  bill_status sponsor_name
@@ -294,7 +295,6 @@ bill_debates |>
 ```{r bill-transcript}
 # Use the formats_xml URI from the debates tibble
 second_stage_uri <- bill_debates |>
-  filter(grepl("Health.*Miscellaneous", section_title, ignore.case = TRUE)) |>
   pull(formats_xml) |>
   head(1)
 
@@ -328,10 +328,10 @@ divs <- get_divisions(
 
 # Filter to divisions that mention the bill
 bill_votes <- divs |>
-  filter(grepl("Health.*Miscellaneous", subject, ignore.case = TRUE))
+  filter(grepl("health", title, ignore.case = TRUE))
 
 bill_votes |>
-  select(date, division_no, subject, count_ta, count_nil, count_staon)
+  select(date, vote_id, title, count_ta, count_nil, count_staon)
 #> # A tibble: 4 × 6
 #>   date       division_no subject                    count_ta count_nil count_staon
 #>   <chr>            <chr> <chr>                         <chr>     <chr>       <chr>
@@ -345,14 +345,32 @@ bill_votes |>
 ```{r vote-breakdown}
 # Take the last division (typically the 5th Stage / final vote)
 final_div_id <- bill_votes |>
-  slice_max(as.integer(division_no), n = 1) |>
+  slice_max(as.integer(gsub('vote_','',vote_id)), n = 1) |>
   pull(division_id)
 
 votes <- get_division_votes(final_div_id)
 
+
+votes <- bill_votes |>
+  filter(division_id == final_div_id) |>
+  select(division_id, date, member_id_ta, members_id_nil, members_id_staon) |>
+  # 1. Turn the three columns into two: 'vote_type' and 'member_ids'
+  tidyr::pivot_longer(
+    cols = starts_with("member"), 
+    names_to = "vote_type", 
+    values_to = "member_id"
+  ) |>
+  # 2. Now separate. Since it's one column, different counts don't matter.
+  tidyr::separate_longer_delim(member_id, delim = ";") |>
+  # 3. Clean up the vote_type names (optional)
+  mutate(vote_type = sub("members?_id_", "", vote_type)) |>
+  # 4. Remove any empty rows (if a vote type had no members)
+  filter(!is.na(member_id) & member_id != "")
+
+print(votes)
 votes |>
-  count(vote, name = "n_members") |>
-  mutate(vote = recode(vote, ta = "Tá (Yes)", nil = "Níl (No)",
+  count(vote_type, name = "n_members") |>
+  mutate(vote = recode(vote_type, ta = "Tá (Yes)", nil = "Níl (No)",
                        staon = "Staon (Abstain)"))
 #> # A tibble: 2 × 2
 #>   vote          n_members
@@ -363,11 +381,11 @@ votes |>
 
 ```{r plot-vote, fig.width=5, fig.height=3.5}
 votes |>
-  count(vote) |>
+  count(vote_type) |>
   mutate(
-    vote  = recode(vote, ta = "Tá (Yes)", nil = "Níl (No)",
+    vote  = recode(vote_type, ta = "Tá (Yes)", nil = "Níl (No)",
                    staon = "Staon (Abstain)"),
-    vote  = factor(vote, levels = c("Tá (Yes)", "Níl (No)", "Staon (Abstain)"))
+    vote  = factor(vote_type, levels = c("Tá (Yes)", "Níl (No)", "Staon (Abstain)"))
   ) |>
   ggplot(aes(x = vote, y = n, fill = vote)) +
   geom_col(width = 0.5, show.legend = FALSE) +
@@ -380,8 +398,7 @@ votes |>
   scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
   labs(
     title    = "Health (Misc. Provisions) Bill 2022 — Final Division",
-    subtitle = paste0("Division no. ", bill_votes$division_no[nrow(bill_votes)],
-                      " · ", bill_votes$date[nrow(bill_votes)]),
+    subtitle = paste0("Division no. "),
     x        = NULL,
     y        = "Members"
   ) +

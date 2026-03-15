@@ -27,7 +27,9 @@
 
 #' AKN 3.0 XML namespace
 #' @keywords internal
-.akn_ns <- c(akn = "http://docs.oasis-open.org/legaldocml/ns/akn/3.0")
+# Updated to match your specific XML sample suffix (CSD13)
+.akn_ns <- c(akn = "http://docs.oasis-open.org/legaldocml/ns/akn/3.0/CSD13")
+
 
 # ---------------------------------------------------------------------------
 # Public function
@@ -89,160 +91,125 @@ get_debate_text <- function(uri,
 # Internal parser
 # ---------------------------------------------------------------------------
 
-#' Parse an Akoma Ntoso XML document into a tidy tibble
+#' Parse an Akoma Ntoso 3.0 XML debate transcript into a tidy tibble
+#'
+#' @param xml_doc An xml2 document object.
+#' @param by_para Logical. If TRUE, returns one row per paragraph. If FALSE, collapses speech.
+#' @param include_narrative Logical. If TRUE, includes summary and narrative tags.
+#'
+#' @return A tibble with columns: section_id, section_heading, speech_no, speech_type, 
+#'         speaker_ref, speaker_uri, speaker_name, para_no, and text.
+#' @importFrom xml2 xml_find_all xml_find_first xml_attr xml_text xml_ns xml_children xml_name
+#' @importFrom dplyr bind_rows % > %
+#' @importFrom purrr map_chr map2
+#' @importFrom tibble tibble
 #' @keywords internal
 .parse_akn <- function(xml_doc, by_para = TRUE, include_narrative = FALSE) {
-
-  ns <- .akn_ns
-
-  # ------------------------------------------------------------------
-  # 1. Build speaker lookup from <meta>/<references>
-  # ------------------------------------------------------------------
-  ref_nodes  <- xml2::xml_find_all(xml_doc, ".//akn:references/akn:TLCPerson", ns)
-  # Fall back to non-namespaced if document uses no namespace
-  if (length(ref_nodes) == 0) {
-    ref_nodes <- xml2::xml_find_all(xml_doc, ".//references/TLCPerson")
-    ns        <- character(0)   # signal: use no-namespace XPaths below
+  
+  # 1. Dynamic Namespace Detection
+  # Oireachtas XML often fluctuates between .../akn/3.0 and .../akn/3.0/CSD13
+  # Robust Namespace Extraction
+  all_ns <- xml2::xml_ns(xml_doc)
+  akn_uri <- as.character(all_ns[grepl("legaldocml", all_ns)])[1]
+  
+  if (is.na(akn_uri)) {
+    # Fallback if no Akoma Ntoso namespace is found
+    ns <- character(0) 
+  } else {
+    ns <- c(akn = akn_uri)
   }
-
+  # 2. Build speaker lookup from <meta>/<references>
+  # Using eId because Oireachtas Akoma Ntoso uses eId for references
+  ref_nodes <- xml2::xml_find_all(xml_doc, ".//akn:references/akn:TLCPerson", ns)
+  
   speaker_lookup <- if (length(ref_nodes) > 0) {
-    ids    <- xml2::xml_attr(ref_nodes, "id")
+    ids    <- xml2::xml_attr(ref_nodes, "eId")
     hrefs  <- xml2::xml_attr(ref_nodes, "href")
     names_ <- xml2::xml_attr(ref_nodes, "showAs")
+    
     stats::setNames(
-      lapply(seq_along(ids), function(i) list(uri = hrefs[i], name = names_[i])),
+      purrr::map2(hrefs, names_, ~list(uri = .x, name = .y)),
       ids
     )
   } else {
     list()
   }
-
-  # ------------------------------------------------------------------
-  # 2. Helper: build xpath accounting for namespace presence
-  # ------------------------------------------------------------------
-  xp <- function(path) {
-    if (length(ns) == 0) gsub("akn:", "", path) else path
-  }
-
-  # ------------------------------------------------------------------
-  # 3. Walk every debateSection, collecting utterances
-  # ------------------------------------------------------------------
-  # We flatten all sections rather than recurse, collecting the heading
-  # of the innermost section ancestor for each utterance.
+  
+  # 3. Define Utterance Types
   utterance_types <- c("speech", "question", "answer")
-  if (include_narrative) utterance_types <- c(utterance_types, "narrative")
-
-  all_sections <- xml2::xml_find_all(xml_doc, xp(".//akn:debateSection"), ns)
-  if (length(all_sections) == 0) {
-    all_sections <- xml2::xml_find_all(xml_doc, ".//debateSection")
-  }
-
+  if (include_narrative) utterance_types <- c(utterance_types, "summary", "narrative")
+  
+  # 4. Walk Sections
+  all_sections <- xml2::xml_find_all(xml_doc, ".//akn:debateSection", ns)
   speech_counter <- 0L
   rows <- list()
-
+  
   for (section in all_sections) {
-    section_id      <- xml2::xml_attr(section, "id") %||% NA_character_
-    heading_node    <- xml2::xml_find_first(section, xp("akn:heading"), ns)
+    section_id      <- xml2::xml_attr(section, "eId")
+    heading_node    <- xml2::xml_find_first(section, "./akn:heading", ns)
+    
+    # Clean heading text (removes timestamp text often found inside headings)
     section_heading <- if (!inherits(heading_node, "xml_missing")) {
-      trimws(xml2::xml_text(heading_node))
+      base_text <- xml2::xml_text(heading_node)
+      trimws(sub("\\d{2}:\\d{2}:\\d{2}.*$", "", base_text))
     } else NA_character_
-
-    # Only direct children that are utterances (avoid double-counting from
-    # nested sections)
+    
+    # Get immediate children to avoid double-counting nested sections
     children <- xml2::xml_children(section)
-    child_names <- xml2::xml_name(children)
-
-    for (i in seq_along(children)) {
-      child      <- children[[i]]
-      child_type <- child_names[[i]]
-      # Strip namespace prefix if present (e.g., "akn:speech" → "speech")
-      child_type <- sub("^.*:", "", child_type)
-
+    
+    for (child in children) {
+      child_type <- xml2::xml_name(child)
       if (!child_type %in% utterance_types) next
-
+      
       speech_counter <- speech_counter + 1L
-
-      if (child_type == "narrative") {
-        rows[[length(rows) + 1L]] <- tibble::tibble(
-          section_id      = section_id,
-          section_heading = section_heading,
-          speech_no       = speech_counter,
-          speech_type     = "narrative",
-          speaker_ref     = NA_character_,
-          speaker_uri     = NA_character_,
-          speaker_name    = NA_character_,
-          para_no         = if (by_para) 1L else NA_integer_,
-          text            = trimws(xml2::xml_text(child))
-        )
-        next
-      }
-
-      # --- speech / question / answer ---
-      by_raw     <- xml2::xml_attr(child, "by") %||% NA_character_
-      ref_key    <- sub("^#", "", by_raw %||% "")
+      
+      # Speaker Metadata
+      by_raw  <- xml2::xml_attr(child, "by")
+      ref_key <- sub("^#", "", by_raw %||% "")
       speaker_lu <- speaker_lookup[[ref_key]]
-
-      speaker_uri  <- speaker_lu$uri  %||% NA_character_
-      speaker_name_lu <- speaker_lu$name %||% NA_character_
-
-      # Prefer <from> text; fall back to lookup
-      from_node    <- xml2::xml_find_first(child, xp("akn:from"), ns)
+      
+      # Priority: <from> tag text > Meta Lookup
+      from_node <- xml2::xml_find_first(child, "./akn:from", ns)
       speaker_name <- if (!inherits(from_node, "xml_missing")) {
-        # Strip trailing colon and whitespace ("Mary Murphy:" → "Mary Murphy")
         trimws(sub(":+\\s*$", "", xml2::xml_text(from_node)))
       } else {
-        speaker_name_lu
+        speaker_lu$name %||% NA_character_
       }
-
-      # Paragraphs (also span/inline text not wrapped in <p> is ignored)
-      para_nodes <- xml2::xml_find_all(child, xp("akn:p"), ns)
-      if (length(para_nodes) == 0) {
-        para_nodes <- xml2::xml_find_all(child, "p")
-      }
-
-      if (length(para_nodes) == 0) next   # speech with no text
-
+      
+      # Extract Paragraphs
+      para_nodes <- xml2::xml_find_all(child, "./akn:p", ns)
+      if (length(para_nodes) == 0) para_nodes <- list(child) # Handle block-level text
+      
       if (by_para) {
-        para_rows <- purrr::imap(para_nodes, function(p, idx) {
-          tibble::tibble(
+        for (idx in seq_along(para_nodes)) {
+          rows[[length(rows) + 1L]] <- tibble::tibble(
             section_id      = section_id,
             section_heading = section_heading,
             speech_no       = speech_counter,
             speech_type     = child_type,
             speaker_ref     = ref_key,
-            speaker_uri     = speaker_uri,
+            speaker_uri     = speaker_lu$uri %||% NA_character_,
             speaker_name    = speaker_name,
             para_no         = as.integer(idx),
-            text            = trimws(xml2::xml_text(p))
+            text            = trimws(xml2::xml_text(para_nodes[[idx]]))
           )
-        })
-        rows <- c(rows, para_rows)
+        }
       } else {
-        full_text <- paste(
-          trimws(purrr::map_chr(para_nodes, xml2::xml_text)),
-          collapse = "\n"
-        )
         rows[[length(rows) + 1L]] <- tibble::tibble(
           section_id      = section_id,
           section_heading = section_heading,
           speech_no       = speech_counter,
           speech_type     = child_type,
           speaker_ref     = ref_key,
-          speaker_uri     = speaker_uri,
+          speaker_uri     = speaker_lu$uri %||% NA_character_,
           speaker_name    = speaker_name,
           para_no         = NA_integer_,
-          text            = full_text
+          text            = paste(trimws(purrr::map_chr(para_nodes, xml2::xml_text)), collapse = "\n")
         )
       }
     }
   }
-
-  if (length(rows) == 0) return(tibble::tibble(
-    section_id = character(), section_heading = character(),
-    speech_no = integer(), speech_type = character(),
-    speaker_ref = character(), speaker_uri = character(),
-    speaker_name = character(), para_no = integer(), text = character()
-  ))
-
+  
+  if (length(rows) == 0) return(NULL)
   dplyr::bind_rows(rows)
 }

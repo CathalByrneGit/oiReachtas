@@ -32,7 +32,7 @@ get_parties <- function(chamber = "",
     items <- .oir_get_all("/parties", params, limit = limit)
   } else {
     resp  <- .oir_get("/parties", c(params, .oir_pagination(limit, skip)))
-    items <- resp$results$items %||% list()
+    items <- resp$results %||% list()
   }
 
   .parse_parties(items)
@@ -43,11 +43,11 @@ get_parties <- function(chamber = "",
   if (length(items) == 0) return(tibble::tibble())
 
   rows <- purrr::map(items, function(item) {
-    p <- item$party %||% item
+    p <- item
     tibble::tibble(
-      party_id   = .null_na(p$uri),
-      party_code = .null_na(p$partyCode),
-      name       = .null_na(p$showAs %||% p$name),
+      party_id   = .null_na(p$party$uri),
+      party_code = .null_na(p$party$partyCode),
+      name       = .null_na(p$party$showAs %||% p$party$name),
       chamber    = .null_na(p$house$showAs %||% NA_character_),
       house_no   = .null_na(p$house$houseNo %||% NA_character_)
     )

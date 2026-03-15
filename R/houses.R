@@ -22,14 +22,12 @@
 #' get_houses(chamber = "dail", house_no = 33)
 #' }
 get_houses <- function(chamber = "",
-                       house_no = NULL,
                        chamber_id = NULL,
                        limit = 50L,
                        skip = 0L,
                        all_pages = FALSE) {
   params <- list(
     chamber    = if (nchar(chamber) > 0) chamber else NULL,
-    house_no   = house_no,
     chamber_id = chamber_id
   )
 
@@ -37,7 +35,7 @@ get_houses <- function(chamber = "",
     items <- .oir_get_all("/houses", params, limit = limit)
   } else {
     resp  <- .oir_get("/houses", c(params, .oir_pagination(limit, skip)))
-    items <- resp$results$items %||% list()
+    items <- resp$results%||% list()
   }
 
   .parse_houses(items)
@@ -52,7 +50,7 @@ get_houses <- function(chamber = "",
     tibble::tibble(
       house_id       = .null_na(h$uri),
       chamber_type   = .null_na(h$chamberType),
-      chamber_id     = .null_na(h$chamberURI),
+      chamber_id     = .null_na(h$chamberCode),
       house_no       = .null_na(h$houseNo),
       show_as        = .null_na(h$showAs),
       date_start     = .null_na(h$dateRange$start %||% NA_character_),

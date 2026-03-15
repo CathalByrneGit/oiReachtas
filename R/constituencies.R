@@ -32,7 +32,7 @@ get_constituencies <- function(chamber = "",
     items <- .oir_get_all("/constituencies", params, limit = limit)
   } else {
     resp  <- .oir_get("/constituencies", c(params, .oir_pagination(limit, skip)))
-    items <- resp$results$items %||% list()
+    items <- resp$results %||% list()
   }
 
   .parse_constituencies(items)
@@ -44,13 +44,13 @@ get_constituencies <- function(chamber = "",
 
   rows <- purrr::map(items, function(item) {
     c <- item$constituency %||% item
+    print(c)
     tibble::tibble(
-      constituency_id   = .null_na(c$uri),
-      name              = .null_na(c$showAs %||% c$name),
-      constituency_type = .null_na(c$constituencyType),
-      chamber           = .null_na(c$house$showAs %||% NA_character_),
-      house_no          = .null_na(c$house$houseNo %||% NA_character_),
-      seats             = .null_na(c$seats %||% NA_integer_)
+      panel_id   = .null_na(c$uri),
+      name              = .null_na(c$showAs %||% NA_character_ ),
+      panel_type = .null_na(c$representType),
+      chamber           = .null_na(item$house$houseCode %||% NA_character_),
+      house_no          = .null_na(item$house$houseNo %||% NA_character_),
     )
   })
 
