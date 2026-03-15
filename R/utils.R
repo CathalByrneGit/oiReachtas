@@ -77,10 +77,15 @@
     # Retryable: 429 (rate limit) or transient 5xx
     retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
     if (retryable && attempt <= max_retries) {
+      # resp_header() returns NULL when absent; as.numeric(NULL) = numeric(0), not NA
       retry_after <- suppressWarnings(
-        as.numeric(httr2::resp_header(resp, "retry-after"))
+        as.numeric(httr2::resp_header(resp, "retry-after") %||% NA_real_)
       )
-      sleep_for <- if (!is.na(retry_after) && retry_after > 0) retry_after else wait
+      sleep_for <- if (length(retry_after) == 1L && !is.na(retry_after) && retry_after > 0) {
+        retry_after
+      } else {
+        wait
+      }
       message(sprintf(
         "[oiReachtas] HTTP %d – retrying in %.0fs (attempt %d/%d)",
         status, sleep_for, attempt, max_retries
@@ -152,8 +157,14 @@
 
     retryable <- status %in% c(429L, 500L, 502L, 503L, 504L)
     if (retryable && attempt <= max_retries) {
-      retry_after <- suppressWarnings(as.numeric(httr2::resp_header(resp, "retry-after")))
-      sleep_for <- if (!is.na(retry_after) && retry_after > 0) retry_after else wait
+      retry_after <- suppressWarnings(
+        as.numeric(httr2::resp_header(resp, "retry-after") %||% NA_real_)
+      )
+      sleep_for <- if (length(retry_after) == 1L && !is.na(retry_after) && retry_after > 0) {
+        retry_after
+      } else {
+        wait
+      }
       message(sprintf("[oiReachtas] HTTP %d – retrying XML fetch in %.0fs", status, sleep_for))
       Sys.sleep(sleep_for); wait <- wait * 2; next
     }
@@ -242,7 +253,25 @@
                     page, skip, limit))
 
     page_params <- c(params, .oir_pagination(limit = limit, skip = skip))
-    resp  <- .oir_get(endpoint, page_params)
+
+    # Catch API errors mid-pagination: return partial results with a warning
+    # rather than throwing and losing everything already collected.
+    resp <- tryCatch(
+      .oir_get(endpoint, page_params),
+      error = function(e) {
+        if (length(results) > 0L) {
+          warning(sprintf(
+            "[oiReachtas] Pagination stopped at page %d (skip=%d): %s\n  Returning %d items collected so far.",
+            page, skip, conditionMessage(e), length(results)
+          ))
+          NULL
+        } else {
+          stop(e)   # nothing collected yet — re-throw so caller sees the error
+        }
+      }
+    )
+    if (is.null(resp)) break   # partial-results early exit
+
     items <- tryCatch(resp$results, error = function(e) {
       message(sprintf("[oiReachtas] Could not extract $results from response. Names: %s",
                       paste(names(resp), collapse = ", ")))
