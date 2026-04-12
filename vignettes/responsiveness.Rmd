@@ -71,10 +71,15 @@ post-windows. Written questions dominate in volume; we include oral questions
 too so the responsiveness signal is as complete as possible.
 
 ```{r fetch}
-qs_raw <- get_questions(
-  date_start = "2023-07-01",   # 14 weeks before Budget
-  date_end   = "2023-12-31",   # 5 weeks after riots
-  all_pages  = TRUE
+
+fetch_period <- function(start, end) {
+  get_questions(date_start = start, date_end = end,
+                question_type = "written", limit = 100, all_pages = TRUE)
+}
+
+qs_raw <- bind_rows(
+  fetch_period("2023-07-01", "2023-09-30"),
+  fetch_period("2023-10-01", "2023-12-31")
 )
 
 qs <- qs_raw |>
@@ -273,6 +278,7 @@ top_depts <- dept_shift |>
 
 dept_shift_top <- dept_shift |>
   filter(department %in% top_depts) |>
+  select(-n)|>
   pivot_wider(names_from = period, values_from = share,
               values_fill = 0, names_prefix = "share_") |>
   # Tidy column names for easy reference
@@ -314,14 +320,21 @@ Government and opposition parties may scrutinise different aspects of the same
 budget. We compare the keyword hit-rate per party in the post-Budget window.
 
 ```{r budget-party}
-members_meta <- get_members(chamber = "dail", house_no = 33,
-                            all_pages = TRUE) |>
-  select(full_name, party_name) |>
-  distinct()
+members <- get_members(chamber = "dail", house_no = 33, all_pages = TRUE) 
+
+member_ids <- members$member_code|>unique()
+
+party_details <- lapply(member_ids,\(x) get_member_parties(member_id = x))|>
+  do.call(what= rbind)
+
+current_party <- party_details|>
+ filter(house_no == 33)|>
+  group_by(member_id)|>
+  filter(row_number() == 1)
 
 party_response <- qs |>
   filter(days_to_budget >= 0, days_to_budget <= 30) |>
-  left_join(members_meta, by = c("member_name" = "full_name")) |>
+  left_join(current_party, by = c("member_uri" = "member_id")) |>
   filter(!is.na(party_name)) |>
   group_by(party_name) |>
   summarise(
@@ -380,7 +393,6 @@ decay_fit <- nls(
 
 half_life <- log(2) / coef(decay_fit)[["lambda"]]
 cat("Estimated attention half-life:", round(half_life, 1), "days\n")
-#> Estimated attention half-life: 11.3 days
 
 # Predicted curve for plotting
 pred_df <- tibble::tibble(day = seq(0, 40, by = 0.5)) |>

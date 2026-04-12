@@ -88,7 +88,7 @@ get_questions <- function(
       question_no   = .null_na(q$questionNumber),
       answer    = .null_na(q$answerText),
       date          = .null_na(q$date),
-      member_uri    = .null_na(q$by$showAs %||% NA_character_),
+      member_uri    = .null_na(q$by$memberCode %||% NA_character_),
       member_name   = .null_na(q$by$showAs %||% NA_character_),
       department    = .null_na(q$to$showAs %||% NA_character_),
       show_as       = .null_na(q$showAs),

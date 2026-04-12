@@ -92,7 +92,7 @@ debates_raw <- get_debates(
   chamber    = "dail",
   date_start = "2024-01-01",
   date_end   = "2024-03-31",
-  limit      = 500,
+  limit      = 1000,
   all_pages  = TRUE
 )
 
@@ -118,7 +118,7 @@ fetch_safe <- possibly(
   otherwise = NULL
 )
 
-transcripts_raw <- oral_debates |>
+transcripts_raw <- debates_raw |>
   select(debate_id, date, formats_xml) |>
   mutate(
     transcript = map(formats_xml, fetch_safe)
@@ -144,7 +144,7 @@ question text and the answer text for that exchange.
 ```{r pair-qa}
 # ── Keep only question and answer speech types ───────────────────────────────
 qa_speeches <- transcripts_raw |>
-  filter(speech_type %in% c("question", "answer"),
+  filter(speech_type %in% c("question", "speech"),
          !is.na(text),
          nchar(trimws(text)) > 0)
 
@@ -159,7 +159,7 @@ questions_df <- qa_speeches |>
   )
 
 answers_df <- qa_speeches |>
-  filter(speech_type == "answer") |>
+  filter(speech_type == "speech") |>
   group_by(section_id) |>
   summarise(
     answer_text    = paste(text, collapse = " "),

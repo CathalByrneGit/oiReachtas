@@ -59,6 +59,7 @@ library(ggplot2)
 library(ggrepel)
 library(scales)
 library(tidytext)   # TF-IDF, tokenisation
+library(tibble)
 
 # UMAP — install if needed: install.packages("uwot")
 library(uwot)
@@ -72,34 +73,44 @@ We pull written questions for the most recent completed Dáil session and
 attach party and constituency metadata.
 
 ```{r fetch-questions}
-# ── member roster: biographical + party/constituency ───────────────────────
-# get_members() provides names; get_member_parties() provides affiliations
-members_core <- get_members(chamber = "dail", all_pages = TRUE) |>
-  select(member_id = member_code, member_name = full_name)
-
-members_parties <- get_member_parties(chamber = "dail", all_pages = TRUE) |>
-  group_by(member_id) |>
-  slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
-  ungroup() |>
-  select(member_id, party = party_code, constituency)
-
-members <- members_core |>
-  left_join(members_parties, by = "member_id") |>
-  select(member_name, party, constituency)
 
 # ── 12 months of written questions ──────────────────────────────────────────
-qs_raw <- get_questions(
-  date_start  = "2024-01-01",
-  date_end    = "2024-12-31",
-  question_type = "written",
-  limit       = 5000
+
+fetch_quarter <- function(start, end) {
+  get_questions(date_start = start, date_end = end,
+                question_type = "written", limit = 100, all_pages = TRUE)
+}
+
+qs_raw  <- bind_rows(
+  fetch_quarter("2023-10-01", "2023-12-31"),
+  fetch_quarter("2024-01-01", "2024-03-30"),
+  fetch_quarter("2024-04-01", "2024-06-30"),
+  fetch_quarter("2024-07-01", "2024-09-30"),
+  fetch_quarter("2024-10-01", "2024-12-31")
 )
+
+# ── member roster: biographical + party/constituency ───────────────────────
+# get_members() provides names; get_member_parties() provides affiliations
+members <- get_members(chamber = "dail", house_no = 33, all_pages = TRUE) 
+
+member_ids <- members$member_code|>unique()
+
+party_details <- lapply(member_ids,\(x) get_member_parties(member_id = x))|>
+  do.call(what= rbind)
+
+current_party <- party_details|>
+ filter(house_no == 33)|>
+  group_by(member_id)|>
+  filter(row_number() == 1)
+
+
+
 
 # Keep only the fields we need and join member metadata
 # member_name in questions == full_name / showAs display string
 qs <- qs_raw |>
-  select(member_name, show_as, department) |>
-  left_join(members, by = "member_name") |>
+  select(member_name,member_uri, show_as, department) |>
+  left_join(current_party, by = c("member_uri" = "member_id")) |>
   filter(!is.na(member_name), !is.na(show_as), nchar(show_as) > 5)
 
 glimpse(qs)
@@ -126,19 +137,36 @@ oireachtas_stops <- tibble(word = c(
   "request", "asked", "stated", "confirm", "outlined"
 ))
 
+# Create a "black list" of all names (first, middle, and last)
+name_words <- qs_raw |>
+  distinct(member_name) |>
+  unnest_tokens(word, member_name) |>
+  distinct(word) |>
+  pull(word)
+
 # Tokenise + TF-IDF ──────────────────────────────────────────────────────────
 tidy_qs <- qs |>
   unnest_tokens(word, show_as) |>
   anti_join(stop_words,       by = "word") |>
   anti_join(oireachtas_stops, by = "word") |>
-  filter(nchar(word) > 2, !grepl("^[0-9]+$", word))
+  filter(nchar(word) > 2, !grepl("^[0-9]+$", word))|>
+  filter(!word %in% name_words) 
 
 member_tfidf <- tidy_qs |>
   count(member_name, word, name = "n") |>
   bind_tf_idf(term = word, document = member_name, n = n)
 
+
+
+# Filter your TF-IDF results using that list
+tidy_tfidf <- member_tfidf |>
+  # Remove words that are part of any TD's name
+  filter(!word %in% name_words) |> 
+  group_by(member_name) |>
+  slice_max(tf_idf, n = 10) |>
+  ungroup()
 # Top-5 signature terms per member (their "shot chart")
-member_tfidf |>
+tidy_tfidf |>
   group_by(member_name) |>
   slice_max(tf_idf, n = 5, with_ties = FALSE) |>
   ungroup() |>
@@ -152,18 +180,18 @@ Before individual profiling, see which terms most distinguish each party.
 
 ```{r party-vocab}
 party_tfidf <- tidy_qs |>
-  left_join(select(qs, member_name, party), by = "member_name") |>
-  count(party, word, name = "n") |>
-  bind_tf_idf(term = word, document = party, n = n)
+  filter(!word %in% name_words) |> 
+  count(party_name, word, name = "n") |>
+  bind_tf_idf(term = word, document = party_name, n = n)
 
 party_tfidf |>
-  group_by(party) |>
+  group_by(party_name) |>
   slice_max(tf_idf, n = 6, with_ties = FALSE) |>
   ungroup() |>
-  mutate(word = reorder_within(word, tf_idf, party)) |>
-  ggplot(aes(tf_idf, word, fill = party)) +
+  mutate(word = reorder_within(word, tf_idf, party_name)) |>
+  ggplot(aes(tf_idf, word, fill = party_name)) +
   geom_col(show.legend = FALSE) +
-  facet_wrap(~party, scales = "free_y", ncol = 3) +
+  facet_wrap(~party_name, scales = "free_y", ncol = 3) +
   scale_y_reordered() +
   scale_fill_manual(values = c(
     "FF" = "#66BB6A", "FG" = "#42A5F5", "SF" = "#4CAF50",
@@ -227,6 +255,7 @@ domain_lookup <- imap_dfr(domains, ~ tibble(word = .x, domain = .y))
 
 # Score each member per domain
 member_domains <- tidy_qs |>
+  filter(!word %in% name_words) |> 
   inner_join(domain_lookup, by = "word") |>
   count(member_name, domain, name = "domain_n") |>
   group_by(member_name) |>
@@ -235,11 +264,11 @@ member_domains <- tidy_qs |>
 
 # Summary: which domains dominate for each party?
 member_domains |>
-  left_join(select(qs, member_name, party) |> distinct(), by = "member_name") |>
-  group_by(party, domain) |>
+  left_join(select(qs, member_name, party_name) |> distinct(), by = "member_name") |>
+  group_by(party_name, domain) |>
   summarise(mean_pct = mean(domain_pct), .groups = "drop") |>
-  slice_max(mean_pct, n = 3, by = party) |>
-  arrange(party, desc(mean_pct))
+  slice_max(mean_pct, n = 3, by = party_name) |>
+  arrange(party_name, desc(mean_pct))
 ```
 
 ### 4.1  Radar chart for individual members
@@ -279,7 +308,7 @@ plot_member_radar <- function(member, colour = "#42A5F5") {
 # ── Example: compare two members side by side ───────────────────────────────
 # Replace with any names returned by get_members()
 p1 <- plot_member_radar("Mary Lou McDonald", colour = "#4CAF50")
-p2 <- plot_member_radar("Micheál Martin",    colour = "#66BB6A")
+p2 <- plot_member_radar("Cian O'Callaghan",    colour = "#66BB6A")
 
 # Combine with patchwork if available, otherwise print individually
 if (requireNamespace("patchwork", quietly = TRUE)) {
@@ -322,9 +351,21 @@ cat("Matrix dimensions:", nrow(member_mat), "members ×",
 ```
 
 ```{r pca}
-pca_res <- prcomp(member_mat, center = TRUE, scale. = TRUE)
+# 1. Identify columns where the standard deviation is 0
+constant_cols <- which(apply(member_mat, 2, sd) == 0)
 
-# Scree plot — how many components are meaningful?
+# 2. If there are constant columns, remove them
+if (length(constant_cols) > 0) {
+  member_mat_clean <- member_mat[, -constant_cols]
+  cat("Removed", length(constant_cols), "constant columns.\n")
+} else {
+  member_mat_clean <- member_mat
+}
+
+# 3. Now run PCA safely
+pca_res <- prcomp(member_mat_clean, center = TRUE, scale. = TRUE)
+
+# 4. Now your Scree Plot code will work!
 tibble(
   pc  = seq_along(pca_res$sdev),
   var = pca_res$sdev^2 / sum(pca_res$sdev^2) * 100
@@ -335,32 +376,54 @@ tibble(
   geom_line(colour = "grey40") +
   geom_point(colour = "grey40") +
   labs(
-    title = "PCA scree plot",
-    x     = "Principal component",
-    y     = "Variance explained (%)"
+    title = "PCA Scree Plot",
+    subtitle = paste("Based on", ncol(member_mat_clean), "non-constant terms"),
+    x     = "Principal Component",
+    y     = "Variance Explained (%)"
   ) +
   theme_minimal()
 ```
 
+```{r}
+# Get the "loadings" (how much each word contributes to the PC)
+loadings <- as.data.frame(pca_res$rotation) |>
+  rownames_to_column("word")
+
+# Look at the top words for PC1
+pc1_top <- loadings |>
+  select(word, PC1) |>
+  arrange(desc(abs(PC1))) |>
+  head(20)
+
+print(pc1_top)
+```
+
+
 ```{r pca-map}
+
+members_clean <- qs|>
+  group_by(member_uri)|>
+  filter(row_number() == 1)|>
+  select(member_name,member_uri,party_name,constituency)
 # PC scores + party labels
 pca_scores <- as_tibble(pca_res$x[, 1:4], rownames = "member_name") |>
-  left_join(select(members, member_name, party, constituency), by = "member_name")
+  left_join(members_clean, by = "member_name")
 
 # Party palette
 party_colours <- c(
-  "FF"  = "#66BB6A", "FG" = "#42A5F5", "SF" = "#4CAF50",
-  "Lab" = "#EF5350", "GP" = "#26A69A", "SD" = "#AB47BC",
-  "PBP" = "#FF7043", "Ind" = "#78909C"
+  "Fianna Fáil"  = "#66BB6A", "Fine Gael" = "#42A5F5", "Sinn Féin" = "#4CAF50",
+  "Labour Party" = "#EF5350", "Green Party" = "#26A69A", "Social Democrats" = "#AB47BC",
+  "People Before Profit-Solidarity" = "#FF7043", "Independent" = "#78909C","Aontú" = "pink",
+  "Independents 4 Change" = "purple"
 )
 
-ggplot(pca_scores, aes(PC1, PC2, colour = party, label = member_name)) +
+ggplot(pca_scores, aes(PC1, PC2, colour = party_name, label = member_name)) +
   geom_point(size = 2.5, alpha = 0.85) +
   geom_text_repel(size = 2.5, max.overlaps = 18, segment.colour = "grey70") +
   scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
   labs(
     title    = "Dáil members — political map (question-based PCA)",
-    subtitle = "PC1 ≈ government–opposition axis · PC2 ≈ activist–rural axis",
+    subtitle = "PC1 ≈ Irish-English Questions · PC2 ≈ government–opposition axis",
     x        = "PC1", y = "PC2", colour = "Party",
     caption  = "Source: Oireachtas Open Data API — written questions 2024"
   ) +
@@ -377,15 +440,15 @@ loadings <- as_tibble(pca_res$rotation[, 1:2], rownames = "word")
 
 # Top 15 terms pulling in each direction
 bind_rows(
-  slice_min(loadings, PC1, n = 15) |> mutate(direction = "← PC1 (govt end)"),
-  slice_max(loadings, PC1, n = 15) |> mutate(direction = "→ PC1 (oppo end)")
+  slice_min(loadings, PC2, n = 15) |> mutate(direction = "← PC2 (govt end)"),
+  slice_max(loadings, PC2, n = 15) |> mutate(direction = "→ PC2 (oppo end)")
 ) |>
   mutate(word = reorder(word, PC1)) |>
   ggplot(aes(PC1, word, fill = direction)) +
   geom_col() +
-  scale_fill_manual(values = c("← PC1 (govt end)" = "#42A5F5",
-                               "→ PC1 (oppo end)" = "#EF5350")) +
-  labs(title = "PC1 loadings — what defines the main axis?",
+  scale_fill_manual(values = c("← PC2 (govt end)" = "#42A5F5",
+                               "→ PC2 (oppo end)" = "#EF5350")) +
+  labs(title = "PC2 loadings — what defines the main axis?",
        x = "Loading", y = NULL, fill = NULL) +
   theme_minimal(base_size = 11)
 ```
@@ -414,9 +477,9 @@ umap_df <- tibble(
   UMAP1       = umap_coords[, 1],
   UMAP2       = umap_coords[, 2]
 ) |>
-  left_join(select(members, member_name, party, constituency), by = "member_name")
+  left_join(members_clean, by = "member_name")
 
-ggplot(umap_df, aes(UMAP1, UMAP2, colour = party, label = member_name)) +
+ggplot(umap_df, aes(UMAP1, UMAP2, colour = party_name, label = member_name)) +
   geom_point(size = 2.5, alpha = 0.85) +
   geom_text_repel(size = 2.5, max.overlaps = 20, segment.colour = "grey70") +
   scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
@@ -428,7 +491,9 @@ ggplot(umap_df, aes(UMAP1, UMAP2, colour = party, label = member_name)) +
   ) +
   theme_minimal(base_size = 11)
 ```
+"Analytical Note: When profiling members, it is vital to strip out names from the corpus. Without this, the UMAP may cluster members by their first names (e.g., a 'Michael' cluster) rather than their policy positions."
 
+Key Insight: After stripping out procedural noise and member names, the UMAP projection reveals a clear Ideological vs. Administrative divide. The proximity between Sinn Féin and the Social Democrats highlights a shared legislative focus, while the dispersion of Government backbenchers reflects the broad, multi-departmental nature of constituency-based questioning.
 ---
 
 ## 7  Member Archetypes — K-Means Clustering
@@ -467,14 +532,14 @@ cluster_df <- tibble(
   member_name = rownames(member_mat),
   archetype   = factor(km_res$cluster)
 ) |>
-  left_join(select(members, member_name, party), by = "member_name")
+  left_join(members_clean, by = "member_name")
 
 # Party composition of each archetype
 cluster_df |>
-  count(archetype, party) |>
+  count(archetype, party_name) |>
   group_by(archetype) |>
   mutate(pct = n / sum(n) * 100) |>
-  slice_max(pct, n = 3) |>
+  slice_max(pct, n = 4) |>
   arrange(archetype, desc(pct))
 ```
 
@@ -552,13 +617,13 @@ find_comps <- function(member, n = 5) {
     comp       = names(head(sims, n)),
     similarity = round(head(sims, n), 3)
   ) |>
-    left_join(select(members, member_name, party, constituency),
+    left_join(members_clean,
               by = c("comp" = "member_name"))
 }
 
 # ── Example: find comps for two members ─────────────────────────────────────
 find_comps("Mary Lou McDonald")
-find_comps("Micheál Martin")
+find_comps("Leo Varadkar")
 ```
 
 ### 8.1  Full similarity network (top comps per member)
@@ -578,18 +643,20 @@ umap_coords_named <- umap_df |>
   select(member_name, UMAP1, UMAP2)
 
 edges_with_coords <- edges |>
+  # Join 'from' coordinates
   left_join(umap_coords_named, by = c("from" = "member_name")) |>
   rename(x = UMAP1, y = UMAP2) |>
-  left_join(umap_coords_named, by = c("to" = "member_name"),
-            suffix = c("", "_end")) |>
-  rename(xend = UMAP1_end, yend = UMAP2_end)
+  # Join 'to' coordinates
+  left_join(umap_coords_named, by = c("to" = "member_name")) |>
+  # Explicitly rename the new UMAP columns to xend/yend
+  rename(xend = UMAP1, yend = UMAP2)
 
 ggplot() +
   geom_segment(data = edges_with_coords,
                aes(x = x, y = y, xend = xend, yend = yend, alpha = weight),
                colour = "#5C6BC0", linewidth = 0.4) +
   geom_point(data = umap_df,
-             aes(UMAP1, UMAP2, colour = party), size = 2.5) +
+             aes(UMAP1, UMAP2, colour = party_name), size = 2.5) +
   scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
   scale_alpha_continuous(range = c(0.1, 0.6), guide = "none") +
   labs(
@@ -631,11 +698,11 @@ lr_scores_text <- tidy_qs |>
 
 # Merge with party labels and sort
 lr_scores_text |>
-  left_join(select(members, member_name, party), by = "member_name") |>
+  left_join(members_clean, by = "member_name") |>
   arrange(lr_text) |>
   mutate(member_name = factor(member_name, levels = member_name)) |>
   filter(!is.na(lr_text)) |>
-  ggplot(aes(lr_text, member_name, colour = party)) +
+  ggplot(aes(lr_text, member_name, colour = party_name)) +
   geom_point(size = 2.5) +
   geom_vline(xintercept = 0, linetype = "dashed", colour = "grey50") +
   scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
@@ -711,8 +778,8 @@ member_scouting_card <- function(member, archetype_labels = NULL) {
   cat("═══════════════════════════════════════════════════════════\n\n")
 
   # Metadata
-  meta <- members |> filter(member_name == member)
-  cat("  Party:          ", meta$party %||% "—", "\n")
+  meta <- members_clean |> filter(member_name == member)
+  cat("  Party:          ", meta$party_name %||% "—", "\n")
   cat("  Constituency:   ", meta$constituency %||% "—", "\n")
 
   # Archetype
@@ -756,7 +823,7 @@ member_scouting_card <- function(member, archetype_labels = NULL) {
   for (i in seq_len(nrow(comps))) {
     cat(sprintf("    %d. %-30s [%s] sim = %.3f\n",
                 i, comps$comp[i],
-                comps$party[i] %||% "—",
+                comps$party_name[i] %||% "—",
                 comps$similarity[i]))
   }
   cat("\n")
@@ -779,9 +846,11 @@ member_scouting_card <- function(member, archetype_labels = NULL) {
 
 # ── Run examples ─────────────────────────────────────────────────────────────
 member_scouting_card("Mary Lou McDonald")
-member_scouting_card("Micheál Martin")
+member_scouting_card("Peadar Tóibín")
 ```
+## TF-IDF captures "Signals": It correctly identified Peadar Tóibín's specific campaign for transparency in ministerial travel.
 
+ **Context Matters:** Without proper stop-word filtering, an "Accountability Activist" (who asks about travel costs) can look like a "Socialist" because they both use the language of government oversight.
 ---
 
 ## 11  Extending to Debate Transcripts

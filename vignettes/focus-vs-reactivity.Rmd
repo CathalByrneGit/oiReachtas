@@ -84,31 +84,53 @@ library(tidytext)
 
 ```{r fetch}
 # ── Member roster: biographical + party/constituency ──────────────────────
-members_core <- get_members(chamber = "dail", all_pages = TRUE) |>
-  select(member_id = member_code, member_name = full_name)
 
-members_parties <- get_member_parties(chamber = "dail", all_pages = TRUE) |>
-  group_by(member_id) |>
-  slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
-  ungroup() |>
-  select(member_id, party = party_code, constituency)
+# ── 12 months of written questions ──────────────────────────────────────────
 
-members <- members_core |>
-  left_join(members_parties, by = "member_id") |>
-  select(member_name, party, constituency)
+fetch_quarter <- function(start, end) {
+  get_questions(date_start = start, date_end = end,
+                question_type = "written", limit = 100, all_pages = TRUE)
+}
 
-# ── Two years of written questions (more time = better consistency signal) ─
-qs_raw <- get_questions(
-  date_start    = "2023-01-01",
-  date_end      = "2024-12-31",
-  question_type = "written",
-  limit         = 9000
+qs_2022_2024  <- bind_rows(
+  fetch_quarter("2022-01-01", "2022-03-30"),
+  fetch_quarter("2022-04-01", "2022-06-30"),
+  fetch_quarter("2022-07-01", "2022-09-30"),
+  fetch_quarter("2022-10-01", "2022-12-31"),
+  fetch_quarter("2023-01-01", "2023-03-30"),
+  fetch_quarter("2023-04-01", "2023-06-30"),
+  fetch_quarter("2023-07-01", "2023-09-30"),
+  fetch_quarter("2023-10-01", "2023-12-31"),
+  fetch_quarter("2024-01-01", "2024-03-30"),
+  fetch_quarter("2024-04-01", "2024-06-30"),
+  fetch_quarter("2024-07-01", "2024-09-30"),
+  fetch_quarter("2024-10-01", "2024-12-31")
 )
 
+qs_raw <- qs_2022_2024
+
+# ── member roster: biographical + party/constituency ───────────────────────
+# get_members() provides names; get_member_parties() provides affiliations
+members <- get_members(chamber = "dail", house_no = 33, all_pages = TRUE) 
+
+member_ids <- members$member_code|>unique()
+
+party_details <- lapply(member_ids,\(x) get_member_parties(member_id = x))|>
+  do.call(what= rbind)
+
+current_party <- party_details|>
+ filter(house_no == 33)|>
+  group_by(member_id)|>
+  filter(row_number() == 1)
+
+
+
+
+
 qs <- qs_raw |>
-  select(member_name, show_as, department, date) |>
-  left_join(members, by = "member_name") |>
-  filter(!is.na(member_name), !is.na(show_as), nchar(show_as) > 5) |>
+  select(member_name,member_uri, show_as, department,date) |>
+  left_join(current_party, by = c("member_uri" = "member_id")) |>
+  filter(!is.na(member_name), !is.na(show_as), nchar(show_as) > 5)|>
   mutate(
     date    = as.Date(date),
     year    = format(date, "%Y"),
@@ -230,11 +252,30 @@ ggplot(focus_scores, aes(hhi_norm)) +
 ```
 
 ```{r focus-bar}
+
+members_clean <- qs|>
+  group_by(member_uri)|>
+  filter(row_number() == 1)|>
+  select(member_name,member_uri,party_name,constituency)|>
+  mutate(
+    party_code = case_when(
+      stringr::str_detect(party_name|>tolower(), "fianna|FF") ~ "FF",
+      stringr::str_detect(party_name|>tolower(), "fine gael|FG") ~ "FG",
+      stringr::str_detect(party_name|>tolower(), "sinn féin|SF") ~ "SF",
+      stringr::str_detect(party_name|>tolower(), "labour|Lab") ~ "Lab",
+      stringr::str_detect(party_name|>tolower(), "green|GP") ~ "GP",
+      stringr::str_detect(party_name|>tolower(), "social dem|SD") ~ "SD",
+      stringr::str_detect(party_name|>tolower(), "people before|PBP") ~ "PBP",
+      TRUE ~ "Ind"
+    )
+  )
+
+
 focus_scores |>
-  left_join(select(members, member_name, party), by = "member_name") |>
+  left_join(members_clean, by = "member_name") |>
   slice_max(hhi_norm, n = 30) |>
   mutate(member_name = reorder(member_name, hhi_norm)) |>
-  ggplot(aes(hhi_norm, member_name, fill = party)) +
+  ggplot(aes(hhi_norm, member_name, fill = party_code)) +
   geom_col() +
   geom_text(aes(label = top_domain), hjust = -0.05, size = 2.8, colour = "grey30") +
   scale_fill_manual(
@@ -290,21 +331,24 @@ quarters_ordered <- sort(unique(quarterly_wide$quarter))
 consistency_scores <- quarterly_wide |>
   group_by(member_name) |>
   group_map(~ {
+    # .x contains the data for one member
     df <- arrange(.x, quarter)
+    
     if (nrow(df) < 2) return(tibble(consistency = NA_real_))
-    vecs <- df |> select(-quarter) |> as.matrix()
-    # Consecutive cosine similarities
+    
+    # Select ONLY numeric columns (the domain shares)
+    vecs <- df |> 
+      select(where(is.numeric)) |> 
+      as.matrix()
+    
+    # Compute consecutive similarities
     sims <- map_dbl(seq_len(nrow(vecs) - 1),
                     ~ cos_sim(vecs[.x, ], vecs[.x + 1, ]))
+    
     tibble(consistency = mean(sims, na.rm = TRUE))
   }, .keep = TRUE) |>
   bind_rows() |>
-  bind_cols(
-    quarterly_wide |>
-      group_by(member_name) |>
-      summarise(.groups = "drop") |>
-      select(member_name)
-  )
+  mutate(member_name = sort(unique(quarterly_wide$member_name)))
 ```
 
 ---
@@ -354,7 +398,7 @@ style_scores <- focus_scores |>
   select(member_name, focus = hhi_norm, top_domain) |>
   inner_join(consistency_scores, by = "member_name") |>
   inner_join(select(dept_diversity, member_name, depts_per_100q), by = "member_name") |>
-  left_join(select(members, member_name, party), by = "member_name") |>
+  left_join(members_clean, by = "member_name") |>
   filter(!is.na(consistency))
 
 # Medians — used for quadrant lines
@@ -370,7 +414,7 @@ quadrant_labels <- tibble(
   label = c("Steady generalist\n(broad, consistent)",
             "Deep specialist\n(focused, consistent)",
             "Populist\n(broad, reactive)",
-            "Bandwagon rider\n(focused, reactive)")
+            "Bandwagon rider or Agile Campaigner\n(focused, reactive)")
 )
 
 party_colours <- c(
@@ -379,7 +423,7 @@ party_colours <- c(
   "PBP" = "#FF7043", "Ind" = "#78909C"
 )
 
-ggplot(style_scores, aes(focus, consistency, colour = party,
+ggplot(style_scores, aes(focus, consistency, colour = party_code,
                           label = member_name)) +
   # Quadrant lines
   geom_vline(xintercept = med_focus, linetype = "dashed",
@@ -478,7 +522,7 @@ ggplot(herd_scores, aes(herd_instinct)) +
 # Does herd instinct correlate with (or diverge from) the focus score?
 style_scores |>
   inner_join(herd_scores, by = "member_name") |>
-  ggplot(aes(focus, herd_instinct, colour = party, label = member_name)) +
+  ggplot(aes(focus, herd_instinct, colour = party_code, label = member_name)) +
   geom_point(size = 2.5, alpha = 0.85) +
   geom_text_repel(size = 2.4, max.overlaps = 15, segment.colour = "grey75") +
   geom_smooth(method = "lm", se = TRUE, colour = "grey40",
@@ -578,7 +622,7 @@ pioneer_index <- classify_at_breakout |>
 
 ```{r pioneer-plot}
 pioneer_index |>
-  left_join(select(members, member_name, party), by = "member_name") |>
+  left_join(members_clean, by = "member_name") |>
   slice_max(abs(pioneer_index), n = 40) |>
   mutate(
     member_name = reorder(member_name, pioneer_index),
@@ -617,7 +661,7 @@ style_summary <- style_scores |>
             by = "member_name") |>
   left_join(select(dept_diversity, member_name, n_depts, depts_per_100q),
             by = "member_name") |>
-  left_join(select(members, member_name, party, constituency),
+  left_join(members_clean,
             by = "member_name") |>
   mutate(
     style_quadrant = case_when(
@@ -627,15 +671,15 @@ style_summary <- style_scores |>
       TRUE                                         ~ "Populist"
     )
   ) |>
-  select(member_name, party, constituency,
-         focus, consistency, herd_instinct, pioneer_index,
+  transmute(member_name, party_code = party_code.x, constituency = constituency.x,
+         focus, consistency , herd_instinct, pioneer_index,
          n_depts, top_domain, style_quadrant) |>
   arrange(desc(focus), desc(consistency))
 
 # Print top specialists
 style_summary |>
   filter(style_quadrant == "Deep specialist") |>
-  select(member_name, party, top_domain, focus, consistency,
+  select(member_name, party_code, top_domain, focus, consistency,
          herd_instinct, pioneer_index) |>
   mutate(across(where(is.double), ~ round(.x, 3))) |>
   print(n = 20)
@@ -645,10 +689,10 @@ style_summary |>
 
 ```{r quadrant-party}
 style_summary |>
-  count(party, style_quadrant) |>
-  group_by(party) |>
+  count(party_code, style_quadrant) |>
+  group_by(party_code) |>
   mutate(pct = n / sum(n) * 100) |>
-  ggplot(aes(style_quadrant, pct, fill = party)) +
+  ggplot(aes(style_quadrant, pct, fill = party_code)) +
   geom_col(position = "dodge") +
   scale_fill_manual(values = party_colours, na.value = "#BDBDBD") +
   scale_y_continuous(labels = label_percent(scale = 1)) +
@@ -674,16 +718,16 @@ annual_hhi <- domain_words |>
             .groups = "drop")
 
 annual_hhi |>
-  inner_join(select(members, member_name, party), by = "member_name") |>
-  ggplot(aes(year, hhi_norm, group = member_name, colour = party)) +
+  inner_join(members_clean, by = "member_name") |>
+  ggplot(aes(year, hhi_norm, group = member_name, colour = party_code)) +
   geom_line(alpha = 0.4, linewidth = 0.6) +
-  stat_summary(aes(group = party), fun = mean,
+  stat_summary(aes(group = party_code), fun = mean,
                geom = "line", linewidth = 1.2) +
-  stat_summary(aes(group = party), fun = mean,
+  stat_summary(aes(group = party_code), fun = mean,
                geom = "point", size = 2.5) +
   scale_colour_manual(values = party_colours, na.value = "#BDBDBD") +
   scale_y_continuous(labels = label_number(accuracy = 0.01)) +
-  facet_wrap(~party, ncol = 4) +
+  facet_wrap(~party_code, ncol = 4) +
   labs(
     title    = "Member focus score over time (by year)",
     subtitle = "Thin lines = individual members · Bold line = party average",

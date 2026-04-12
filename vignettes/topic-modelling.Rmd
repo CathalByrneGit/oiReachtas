@@ -124,14 +124,23 @@ oireachtas_stops <- tibble::tibble(word = c(
   "minister", "taoiseach", "tánaiste", "government", "oireachtas",
   "dáil", "seanad", "department", "agency", "authority", "office",
   "national", "ireland", "irish", "state", "public", "local",
-  "committee", "council",
+  "committee", "council","deputy","supplied","date",
   # Numeric noise
   "1", "2", "3", "2022", "2023", "2024"
 ))
 
+# Add frequent TD names and procedural words to your existing oireachtas_stops
+extra_stops <- tibble::tibble(word = c(
+  "michael", "healy", "rae", "brendan", "griffin", "thomas", "matt", "carthy",
+  "richard", "darren", "o'rourke", "bernard", "durkan", "alan", "tabular", "form"
+))
+
+# Then re-run the anti_join and the LDA
+
 tidy_qs <- tidy_qs |>
   anti_join(stop_words,         by = "word") |>
   anti_join(oireachtas_stops,   by = "word") |>
+  anti_join(extra_stops,         by = "word") |>
   filter(
     !grepl("^[0-9]+$", word),   # remove pure numbers
     nchar(word) > 2              # drop very short tokens
@@ -307,16 +316,15 @@ clusters:
 ```{r topic-labels}
 topic_labels <- tibble::tibble(
   topic = 1:8,
-  label = c(
-    "Housing & Planning",
-    "Health Services & HSE",
-    "Education & Schools",
-    "Roads & Transport",
-    "Agriculture & Rural",
-    "Crime & Policing",
-    "Social Welfare",
-    "Climate & Environment"
-  )
+  label = c("Social Protection & Appeals",
+   "Children, Equality & Culture",
+  "Justice & Policing",
+  "Foreign Affairs & Regional Dev",
+   "Agriculture & Marine",
+  "Health & Environment",
+  "Economy & Infrastructure",
+  "Housing & Education Capital"
+)
 )
 
 # Attach labels to the beta tibble for later plots
@@ -332,6 +340,9 @@ beta_labelled |>
   slice_max(beta, n = 6) |>
   select(label, term, beta) |>
   print(n = 48)
+
+
+
 #> # A tibble: 48 × 3
 #>    label                    term             beta
 #>    <chr>                    <chr>           <dbl>
@@ -430,13 +441,23 @@ We join in party data from `get_members()` and compute each party's topic
 profile — the share of their questions falling into each topic.
 
 ```{r member-party}
-members <- get_members(chamber = "dail", house_no = 33, all_pages = TRUE) |>
-  select(full_name, party_name) |>
-  distinct()
+members <- get_members(chamber = "dail", house_no = 33, all_pages = TRUE) 
+
+member_ids <- members$member_code|>unique()
+
+party_details <- lapply(member_ids,\(x) get_member_parties(member_id = x))|>
+  do.call(what= rbind)
+
+current_party <- party_details|>
+ filter(house_no == 33)|>
+  group_by(member_id)|>
+  filter(row_number() == 1)
+
+
 
 # Join on member name (qs uses show_as name; members uses full_name)
 party_topics <- qs_topics |>
-  left_join(members, by = c("member_name" = "full_name")) |>
+  left_join(current_party, by = c("member_uri" = "member_id")) |>
   filter(!is.na(party_name), !is.na(label)) |>
   # Focus on parties with meaningful question volumes
   group_by(party_name) |>
@@ -534,7 +555,7 @@ ggplot(member_profile,
        aes(x = pct, y = reorder(label, pct), fill = group)) +
   geom_col(position = "dodge", width = 0.65) +
   scale_fill_manual(
-    values = c("All other TDs" = "#bdbdbd", .data[[focus_member]] := "#e76f51"),
+    values = setNames(c("#e76f51", "#bdbdbd"), c(focus_member, "All other TDs")),
     name   = NULL
   ) +
   scale_x_continuous(labels = function(x) paste0(x, "%")) +

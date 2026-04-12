@@ -121,32 +121,63 @@ constituency) and compute electoral proximity.
 ```{r fetch-questions}
 # ── written questions: Jan 2019 – Dec 2024 ──────────────────────────────────
 # Fetch in two blocks to stay within API page limits
-qs_2019_2021 <- get_questions(
-  date_start    = "2019-01-01",
-  date_end      = "2021-12-31",
-  question_type = "written",
-  limit         = 100,
-  all_pages     = TRUE
+
+
+fetch_quarter <- function(start, end) {
+  get_questions(date_start = start, date_end = end,
+                question_type = "written", limit = 100, all_pages = TRUE)
+}
+
+qs_2019_2021 <- bind_rows(
+  fetch_quarter("2019-01-01", "2019-03-30"),
+  fetch_quarter("2019-04-01", "2019-06-30"),
+  fetch_quarter("2019-07-01", "2019-09-30"),
+  fetch_quarter("2019-10-01", "2019-12-31"),
+  fetch_quarter("2020-01-01", "2020-03-30"),
+  fetch_quarter("2020-04-01", "2020-06-30"),
+  fetch_quarter("2020-07-01", "2020-09-30"),
+  fetch_quarter("2020-10-01", "2020-12-31"),
+  fetch_quarter("2021-01-01", "2021-03-30"),
+  fetch_quarter("2021-04-01", "2021-06-30"),
+  fetch_quarter("2021-07-01", "2021-09-30"),
+  fetch_quarter("2021-10-01", "2021-12-31")
 )
 
-qs_2022_2024 <- get_questions(
-  date_start    = "2022-01-01",
-  date_end      = "2024-12-31",
-  question_type = "written",
-  limit         = 100,
-  all_pages     = TRUE
+
+
+qs_2022_2024  <- bind_rows(
+  fetch_quarter("2022-01-01", "2022-03-30"),
+  fetch_quarter("2022-04-01", "2022-06-30"),
+  fetch_quarter("2022-07-01", "2022-09-30"),
+  fetch_quarter("2022-10-01", "2022-12-31"),
+  fetch_quarter("2023-01-01", "2023-03-30"),
+  fetch_quarter("2023-04-01", "2023-06-30"),
+  fetch_quarter("2023-07-01", "2023-09-30"),
+  fetch_quarter("2023-10-01", "2023-12-31"),
+  fetch_quarter("2024-01-01", "2024-03-30"),
+  fetch_quarter("2024-04-01", "2024-06-30"),
+  fetch_quarter("2024-07-01", "2024-09-30"),
+  fetch_quarter("2024-10-01", "2024-12-31")
 )
 
 qs_raw <- bind_rows(qs_2019_2021, qs_2022_2024)
 
 # ── member roster: biographical + party/constituency ────────────────────────
-members <- get_members(chamber = "dail", all_pages = TRUE) |>
+members <- get_members(chamber = "dail", all_pages = TRUE) 
+
+
+party_details <- lapply(members$member_code,\(x) get_member_parties(member_id = x))|>
+  do.call(what= rbind)
+
+member_party <- members|>
   select(member_id = member_code, member_name = full_name) |>
   left_join(
-    get_member_parties(chamber = "dail", all_pages = TRUE) |>
+    party_details |>
       group_by(member_id) |>
       slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
       ungroup() |>
+     group_by(member_id)|>
+     filter(row_number()==1)|>
       select(member_id, party = party_code, constituency),
     by = "member_id"
   ) |>
@@ -155,7 +186,7 @@ members <- get_members(chamber = "dail", all_pages = TRUE) |>
 # ── join and compute electoral proximity ────────────────────────────────────
 qs <- qs_raw |>
   mutate(date = as.Date(date)) |>
-  left_join(members, by = "member_name") |>
+  left_join(member_party, by = "member_name") |>
   mutate(
     weeks_to_elec  = weeks_to_nearest_election(date),
     # Bin into 4-week periods for area charts (-26 to +26 covers ±6 months)
@@ -338,8 +369,8 @@ treat Sinn Féin (SF) as opposition.
 
 ```{r govt-opposition}
 # Government party assignments per Dáil
-govt_parties_33rd <- c("FF", "FG", "GP")    # FF/FG/GP coalition
-govt_parties_34th <- c("FF", "FG")           # provisional; SF in opposition
+govt_parties_33rd <- c("Fianna_Fáil", "Fine_Gael", "Green_Party")    # FF/FG/GP coalition
+govt_parties_34th <- c("Fianna_Fáil", "Fine_Gael")           # provisional; SF in opposition
 
 # Classify each question by govt/opposition status at time of asking
 qs_gov <- qs |>
@@ -371,9 +402,9 @@ ggplot(weekly_by_status,
   geom_vline(xintercept = 0, linetype = "dashed", colour = "black",
              linewidth = 0.8) +
   scale_colour_manual(values = c("Government" = "#1a9641",
-                                 "Opposition" = "#d7191c")) +
+                                 "Opposition" = "blue")) +
   scale_fill_manual(values   = c("Government" = "#1a9641",
-                                 "Opposition" = "#d7191c")) +
+                                 "Opposition" = "blue")) +
   scale_x_continuous(
     breaks = seq(-26, 26, by = 4),
     labels = function(x) paste0(x, "w")
@@ -441,15 +472,15 @@ top20_err <- slice_head(err_data, n = 20) |>
 
 # Party colour palette (standard Irish political colours)
 party_colours <- c(
-  "FF"  = "#006400",   # Fianna Fáil — green
-  "FG"  = "#003DA5",   # Fine Gael — blue
-  "SF"  = "#326760",   # Sinn Féin — dark teal
-  "GP"  = "#99C140",   # Green Party — lime green
-  "Lab" = "#CC0000",   # Labour — red
-  "SD"  = "#7B2D8B",   # Social Democrats — purple
-  "PBP" = "#8B0000",   # People Before Profit — dark red
-  "Ind" = "#999999",   # Independents — grey
-  "AON" = "#FF6600",   # Aontú — orange
+  "Fianna_Fáil"  = "#006400",   # Fianna Fáil — green
+  "Fine_Gael"  = "#003DA5",   # Fine Gael — blue
+  "Sinn_Féin"  = "#326760",   # Sinn Féin — dark teal
+  "Green_Party"  = "#99C140",   # Green Party — lime green
+  "Labour_Party" = "#CC0000",   # Labour — red
+  "Social_Democrats"  = "#7B2D8B",   # Social Democrats — purple
+  "People_Before_Profit_Solidarity" = "#8B0000",   # People Before Profit — dark red
+  "Independent" = "#999999",   # Independents — grey
+  "Aontú" = "#FF6600",   # Aontú — orange
   "NP"  = "#CCCCCC"    # No party / other
 )
 
