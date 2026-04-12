@@ -59,6 +59,7 @@ library(ggplot2)
 library(ggrepel)
 library(scales)
 library(tidytext)
+library(stringr)
 ```
 
 Party colours used consistently throughout:
@@ -74,6 +75,13 @@ party_colours <- c(
   "PBP" = "#FF7043",
   "Ind" = "#78909C"
 )
+
+party_colours <- c(
+  "Fianna Fáil"  = "#66BB6A", "Fine Gael" = "#42A5F5", "Sinn Féin" = "#4CAF50",
+  "Labour Party" = "#EF5350", "Green Party" = "#26A69A", "Social Democrats" = "#AB47BC",
+  "People Before Profit-Solidarity" = "#FF7043", "Independent" = "#78909C","Aontú" = "pink",
+  "Independents 4 Change" = "purple"
+)
 ```
 
 ---
@@ -86,13 +94,22 @@ party_colours <- c(
 window and filter for Question Time sections by name.
 
 ```{r fetch-debates}
-raw_debates <- get_debates(
-  chamber    = "dail",
-  date_start = "2024-09-01",
-  date_end   = "2024-10-31",
-  limit      = 50,
-  all_pages  = TRUE
+
+
+fetch_quarter <- function(start, end) {
+  get_debates(date_start = start, date_end = end,
+                chamber    = "dail", limit = 100, all_pages = TRUE)
+}
+
+raw_debates   <- bind_rows(
+  fetch_quarter("2024-01-01", "2024-03-30"),
+  fetch_quarter("2024-04-01", "2024-06-30"),
+  fetch_quarter("2024-07-01", "2024-09-30"),
+  fetch_quarter("2024-10-01", "2024-12-31")
 )
+
+
+
 
 glimpse(raw_debates)
 #> Rows: 312
@@ -156,19 +173,30 @@ speeches <- transcripts_raw |>
          !is.na(text), nchar(trimws(text)) > 0)
 
 # get_member_parties() is the canonical source of party affiliation
-members <- get_member_parties(chamber = "dail", all_pages = TRUE) |>
-  group_by(member_id) |>
-  slice_max(coalesce(end_date, Sys.Date()), n = 1) |>
-  ungroup() |>
-  select(member_id, party = party_code)
+# get_members() provides names; get_member_parties() provides affiliations
+members <- get_members(chamber = "dail", house_no = 33, all_pages = TRUE) 
+
+member_ids <- members$member_code|>unique()
+
+party_details <- lapply(member_ids,\(x) get_member_parties(member_id = x))|>
+  do.call(what= rbind)
+
+current_party <- party_details|>
+ filter(house_no == 33)|>
+  group_by(member_id)|>
+  filter(row_number() == 1)
+
+
+
 
 speeches <- speeches |>
-  left_join(members, by = c("speaker_ref" = "member_id")) |>
-  mutate(party = coalesce(party, "Ind"),
+  mutate(speaker_uri = gsub('/ie/oireachtas/member/id/','',speaker_uri))|>
+  left_join(current_party, by = c("speaker_uri" = "member_id")) |>
+  mutate(party = coalesce(party_name, "Non-Party"),
          # Normalise minor parties to keep colour palette tidy
          party = case_when(
-           party %in% names(party_colours) ~ party,
-           TRUE ~ "Ind"
+          party %in% names(party_colours) ~ party,
+           TRUE ~ "Non-Party"
          ))
 
 glimpse(speeches)
@@ -252,7 +280,7 @@ versus one-off contributions.
 
 ```{r participation}
 participation <- speech_lengths |>
-  mutate(week = lubridate::floor_date(date, "week")) |>
+  mutate(week = lubridate::floor_date(as.Date(date), "week")) |>
   group_by(speaker_name, speaker_ref, party, week) |>
   summarise(speeches = n(), .groups = "drop")
 
@@ -350,11 +378,10 @@ ggplot(plot_sent,
 
 Tracking how sentiment evolves across a debate reveals its dramatic
 structure — opening pleasantries, rising tensions, closing remarks. We
-pick the longest Taoiseach's Questions session as a case study.
+pick the longest Questions session as a case study.
 
 ```{r pick-debate}
 biggest_debate <- speech_sentiment |>
-  filter(grepl("Taoiseach", section_heading)) |>
   count(debate_id, date) |>
   slice_max(n, n = 1)
 
@@ -363,7 +390,7 @@ arc_data <- speech_sentiment |>
   arrange(speech_no)
 ```
 
-```{r plot-arc, fig.cap="Sentiment arc of the selected Taoiseach's Questions debate. Each point is one speech; the smoothed line shows the rolling chamber temperature."}
+```{r plot-arc, fig.cap="Sentiment arc of the selected Questions debate. Each point is one speech; the smoothed line shows the rolling chamber temperature."}
 ggplot(arc_data, aes(x = speech_no, y = mean_sent)) +
   geom_point(aes(colour = party), size = 2.5, alpha = 0.75) +
   geom_smooth(method = "loess", span = 0.4,
@@ -371,8 +398,8 @@ ggplot(arc_data, aes(x = speech_no, y = mean_sent)) +
   geom_hline(yintercept = 0, linetype = "dashed",
              colour = "grey60", linewidth = 0.4) +
   scale_colour_manual(values = party_colours) +
-  labs(title    = paste("Sentiment Arc —", format(biggest_debate$date, "%d %B %Y")),
-       subtitle = "Taoiseach's Questions; one point per speech",
+  labs(title    = paste("Sentiment Arc —", format(biggest_debate$date|>as.Date(), "%d %B %Y")),
+       subtitle = "Questions; one point per speech",
        x        = "Speech number (chronological order)",
        y        = "Mean AFINN score",
        colour   = "Party") +
@@ -440,13 +467,18 @@ sample_debates <- qt_debates |> slice_sample(n = 30)
 transcripts_speech <- sample_debates |>
   mutate(text_data = map(formats_xml,
                          \(u) safe_text(uri = u, by_para = FALSE))) |>
-  select(debate_id, date, section_heading, text_data) |>
+  select(debate_id, date, text_data) |>
   unnest(text_data) |>
+  mutate(speaker_uri = gsub('/ie/oireachtas/member/id/','',speaker_uri))|>
+  left_join(current_party, by = c("speaker_uri" = "member_id")) |>
   filter(speech_type == "speech",
          !is.na(text), nchar(trimws(text)) > 20) |>
-  left_join(members, by = c("speaker_ref" = "member_id")) |>
-  mutate(party = coalesce(party, "Ind"),
-         party = if_else(party %in% names(party_colours), party, "Ind"))
+  mutate(party = coalesce(party_name, "Non-Party"),
+         # Normalise minor parties to keep colour palette tidy
+         party = case_when(
+          party %in% names(party_colours) ~ party,
+           TRUE ~ "Non-Party"
+         ))
 
 saveRDS(transcripts_speech, "qt_speech_level.rds")
 ```
@@ -473,8 +505,8 @@ member_readability <- readability_scores |>
 
 ```{r join-readability-sentiment}
 combined <- member_readability |>
-  inner_join(member_sentiment |> select(speaker_ref, mean_sent),
-             by = "speaker_ref")
+  inner_join(member_sentiment |> select(speaker_name, mean_sent),
+             by = "speaker_name")
 
 # Label outliers in either dimension
 label_threshold_fk   <- quantile(combined$mean_fk,   c(0.1, 0.9), na.rm = TRUE)
@@ -638,25 +670,6 @@ typically government parties whose ministers deliver long, substantive, and
 (institutionally) positively framed responses. Opposition parties often
 show strong sentiment polarity (high or low) but lower readability, reflecting
 the pointed, sometimes rhetorical nature of adversarial questioning.
-
----
-
-## Summary
-
-| Analysis | Key finding |
-|----------|-------------|
-| Speech length | Government ministers average 2–3× more words than opposition TDs in Priority Questions |
-| Participation | A small cohort of 8–10 frontbenchers account for the majority of interventions |
-| Sentiment | Opposition members score systematically lower on AFINN; government responses trend positive |
-| Sentiment arc | Debates start neutral, dip mid-session during adversarial exchanges, recover at close |
-| Readability | Ministerial answers are less readable (FK < 50) than opposition questions (FK > 60) |
-| Radar | No single party dominates all three rhetorical dimensions simultaneously |
-
-These patterns are consistent with the structural logic of Question Time:
-ministers must defend policy in detail (long, dense, institutionally positive);
-opposition TDs must challenge efficiently (short, plain, emotionally charged).
-The Oireachtas transcript data makes this structural asymmetry measurable and
-reproducible.
 
 ---
 

@@ -52,6 +52,9 @@ party_colours <- c(
   "PBP" = "#FF7043",
   "Ind" = "#78909C"
 )
+
+
+
 ```
 
 ---
@@ -132,24 +135,46 @@ We request the full set of written questions (Dáil chamber) for the twelve mont
 
 ```{r fetch-questions}
 date_end   <- Sys.Date()
-date_start <- date_end - 365
 
-questions_raw <- get_questions(
-  date_start    = format(date_start, "%Y-%m-%d"),
-  date_end      = format(date_end,   "%Y-%m-%d"),
-  question_type = "written",
-  limit         = 100,
-  all_pages     = TRUE
+fetch_quarter <- function(start, end) {
+  get_questions(date_start = start, date_end = end,
+                question_type = "written", limit = 100, all_pages = TRUE)
+}
+
+qs_raw  <- bind_rows(
+  fetch_quarter("2025-01-01", "2025-03-30"),
+  fetch_quarter("2025-04-01", "2025-06-30"),
+  fetch_quarter("2025-07-01", "2025-09-30"),
+  fetch_quarter("2025-10-01", "2025-12-31"),
+  fetch_quarter("2026-01-01", date_end)
+
 )
 
-glimpse(questions_raw)
-cat("Total written questions retrieved:", nrow(questions_raw), "\n")
+glimpse(qs_raw)
+cat("Total written questions retrieved:", nrow(qs_raw), "\n")
 ```
 
 ### 3.2  Member Metadata
 
 ```{r fetch-members}
 # get_members() returns biographical data; get_member_parties() gives party/constituency
+# get_member_parties() is the canonical source of party affiliation
+# get_members() provides names; get_member_parties() provides affiliations
+members <- get_members(chamber = "dail",
+                       date_start = as.Date(2025-01-01),
+                       date_end = date_end,
+                       all_pages = TRUE) 
+
+member_ids <- members$member_code|>unique()
+
+party_details <- lapply(member_ids,\(x) get_member_parties(member_id = x))|>
+  do.call(what= rbind)
+
+current_party <- party_details|>
+ filter(house_no == 33)|>
+  group_by(member_id)|>
+  filter(row_number() == 1)
+
 members_raw <- get_members(chamber = "dail", all_pages = TRUE) |>
   select(member_id = member_code, member_name = full_name) |>
   left_join(
@@ -161,7 +186,11 @@ members_raw <- get_members(chamber = "dail", all_pages = TRUE) |>
     by = "member_id"
   )
 
-glimpse(members_raw)
+members_raw_select <- members_raw|>
+  group_by(member_id)|>
+  filter(row_number() == 1)
+
+glimpse(members_raw_select)
 ```
 
 ### 3.3  Constituency Metadata
@@ -182,7 +211,7 @@ glimpse(constituencies_raw)
 ### 4.1  Classify Each Question
 
 ```{r classify-questions}
-questions_classified <- questions_raw %>%
+questions_classified <- qs_raw %>%
   # Ensure show_as is character; replace NA with empty string
   mutate(
     show_as_clean = tolower(coalesce(show_as, "")),
@@ -199,8 +228,8 @@ questions_classified %>%
 ### 4.2  Join Member Party and Constituency
 
 ```{r join-members}
-members_clean <- members_raw %>%
-  select(member_name, party, party_name, constituency) %>%
+members_clean <- members_raw_select %>%
+  select(member_name, party, party_name, constituency,member_id) %>%
   # Abbreviate party labels to match colour palette
   mutate(
     party_abbr = case_when(
@@ -217,7 +246,9 @@ members_clean <- members_raw %>%
   )
 
 questions_with_meta <- questions_classified %>%
-  left_join(members_clean, by = "member_name")
+  left_join(members_clean, by = c("member_uri"="member_id"))|>
+  rename(member_name = member_name.x)|>
+  select(-member_name.y)
 ```
 
 ### 4.3  Compute Per-Member Local Ratio
@@ -755,8 +786,7 @@ ggplot(department_ratios, aes(x = local_ratio, y = dept_short)) +
 **Interpretation:**
 
 - **High local ratio departments** (e.g. Transport, Rural Development, Housing, Agriculture) face questions about specific roads, rural broadband schemes, named housing estates, and individual farm payments.
-- **Low local ratio departments** (e.g. Finance, Foreign Affairs, Public Expenditure) are more often questioned on national policy frameworks, budget allocations, and international agreements.
-- The Taoiseach's office typically falls in the middle, receiving both constituency-specific representations and broad questions about government direction.
+- **Low local ratio departments** (e.g. Finance, Foreign Affairs, Defence) are more often questioned on national policy frameworks, budget allocations, and international agreements.
 
 ---
 
