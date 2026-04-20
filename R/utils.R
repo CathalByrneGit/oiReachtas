@@ -293,3 +293,88 @@
   if (is.finite(max_records)) results <- results[seq_len(min(length(results), max_records))]
   results
 }
+
+# ---------------------------------------------------------------------------
+# Windowed fetch helper (works around the API's 10,000-record page limit)
+# ---------------------------------------------------------------------------
+
+#' Fetch paginated data in consecutive date windows
+#'
+#' The Oireachtas API returns at most 10,000 records per query (Elasticsearch
+#' `max_result_window`).  For high-volume endpoints like `/questions`, a
+#' multi-year request will silently truncate.  This helper splits a date range
+#' into consecutive windows of `window_months` months, calls `fetch_fn` for
+#' each window with `date_start` / `date_end` injected, and row-binds the
+#' results into a single tibble.
+#'
+#' @param fetch_fn A function that accepts `date_start` and `date_end`
+#'   (ISO `"YYYY-MM-DD"`) plus any additional `...` arguments and returns a
+#'   tibble.  Typically one of [get_questions()], [get_debates()], etc.
+#' @param date_start Character. Overall start date (`"YYYY-MM-DD"`).
+#' @param date_end Character. Overall end date (`"YYYY-MM-DD"`).
+#' @param window_months Integer. Size of each window in months. Default `3`.
+#' @param ... Additional arguments forwarded to `fetch_fn` on every call.
+#'
+#' @return A [tibble][tibble::tibble] combining all windows.
+#' @export
+#'
+#' @examples
+#' \dontrun{
+#' # Fetch all written questions from 2019-2021 without hitting the 10k limit
+#' qs <- fetch_windowed(
+#'   get_questions,
+#'   date_start    = "2019-01-01",
+#'   date_end      = "2021-12-31",
+#'   question_type = "written",
+#'   limit         = 100,
+#'   all_pages     = TRUE
+#' )
+#' }
+fetch_windowed <- function(fetch_fn,
+                           date_start,
+                           date_end,
+                           window_months = 3L,
+                           ...) {
+  .oir_validate_date(date_start, "date_start")
+  .oir_validate_date(date_end,   "date_end")
+
+  start <- as.Date(date_start)
+  end   <- as.Date(date_end)
+
+  if (start > end) {
+    rlang::abort("`date_start` must be on or before `date_end`",
+                 class = "oireachtas_invalid_date")
+  }
+
+  # Build window boundaries
+  windows <- list()
+  win_start <- start
+  while (win_start <= end) {
+    # Add window_months months then subtract one day
+    win_end <- seq(win_start, by = paste(window_months, "months"), length.out = 2L)[2L] - 1L
+    win_end <- min(win_end, end)
+    windows <- c(windows, list(list(s = win_start, e = win_end)))
+    win_start <- win_end + 1L
+  }
+
+  message(sprintf(
+    "[oiReachtas] fetch_windowed: %d window(s) of ~%d months from %s to %s",
+    length(windows), window_months, date_start, date_end
+  ))
+
+  results <- purrr::map(windows, function(w) {
+    message(sprintf("[oiReachtas]   window %s → %s", w$s, w$e))
+    tryCatch(
+      fetch_fn(date_start = format(w$s), date_end = format(w$e), ...),
+      error = function(e) {
+        warning(sprintf(
+          "[oiReachtas] Window %s → %s failed: %s  (skipping)",
+          w$s, w$e, conditionMessage(e)
+        ))
+        tibble::tibble()
+      }
+    )
+  })
+
+  dplyr::bind_rows(results)
+}
